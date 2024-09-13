@@ -18,3 +18,7 @@ Extended slave address : 0x80000000  256 MByte
                                                                                                                                      
       Ethernet address : 00:00:xx:xx:xx:xx
 ```
+
+# Hardware
+
+- Serial: https://bitsavers.computerhistory.org/components/cirrusLogic/_dataSheets/CL-CD2400_2401/CL_CD2400_2401_Four-Channel_Multi-Protocol_Communications_Controller_Data_Sheet_199106.pdf
