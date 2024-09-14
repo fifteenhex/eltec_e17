@@ -21,5 +21,6 @@ Extended slave address : 0x80000000  256 MByte
 
 # Hardware
 
+- gfx bt445
 - CIO (for timers etc): https://www.zilog.com/docs/serial/z08536_ps.pdf
 - Serial: https://bitsavers.computerhistory.org/components/cirrusLogic/_dataSheets/CL-CD2400_2401/CL_CD2400_2401_Four-Channel_Multi-Protocol_Communications_Controller_Data_Sheet_199106.pdf
