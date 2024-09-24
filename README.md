@@ -25,3 +25,4 @@ Extended slave address : 0x80000000  256 MByte
 - CIO (for timers etc): https://www.zilog.com/docs/serial/z08536_ps.pdf
 - Serial: https://bitsavers.computerhistory.org/components/cirrusLogic/_dataSheets/CL-CD2400_2401/CL_CD2400_2401_Four-Channel_Multi-Protocol_Communications_Controller_Data_Sheet_199106.pdf
 - Ethernet: AM79C900
+  - Some programming info: https://www.amd.com/content/dam/amd/en/documents/archived-tech-docs/application-notes/19669.pdf
