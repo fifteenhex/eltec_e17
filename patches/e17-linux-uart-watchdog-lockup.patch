@@ -1,5 +1,5 @@
 diff --git a/arch/m68k/eltec/config.c b/arch/m68k/eltec/config.c
-index 90ce534eb85e..b71b9bca0915 100644
+index 90ce534eb85e..619bc8c84080 100644
 --- a/arch/m68k/eltec/config.c
 +++ b/arch/m68k/eltec/config.c
 @@ -30,6 +30,7 @@
@@ -10,7 +10,7 @@ index 90ce534eb85e..b71b9bca0915 100644
  #ifdef CONFIG_SMP
  #include <asm/smp_e17.h>
  #endif
-@@ -50,6 +51,52 @@
+@@ -50,6 +51,51 @@
   */
  #define E17_POST(code)	(*(volatile u8 *)0xfec30000 = (code) & 0x0f)
  
@@ -50,12 +50,11 @@ index 90ce534eb85e..b71b9bca0915 100644
 + * feeding it the watchdog fires within the jumper period (<=1.6 s) and resets
 + * the whole board back through RMON.
 + */
-+#define E17_CPU2CON	((volatile u8 *)0xfec58000)	/* bit5 SRESET: 0=hold */
-+
 +void e17_reset(void)
 +{
 +	local_irq_disable();
-+	*E17_CPU2CON = 0x00;		/* SRESET=0: park the secondary */
++	/* SRESET=0: park the secondary (E17_CPU2CON is from <asm/smp_e17.h>). */
++	writeb(0x00, (void __iomem *)E17_CPU2CON);
 +	for (;;)
 +		/* starve the watchdog; it resets the board */;
 +}
@@ -63,7 +62,16 @@ index 90ce534eb85e..b71b9bca0915 100644
  /*
   * Watchdog-reset breadcrumb in the battery-backed M48T02 NVRAM (offset 0x600 --
   * past RMON's 0x000-0x5ff system area, below the clock registers), so it survives
-@@ -645,12 +692,19 @@ static irqreturn_t e17_timer_int(int irq, void *dev_id)
+@@ -70,6 +116,8 @@
+ #define E17_BC_IRQERR	9	/* irq_err_count low byte (spurious/bad IACKs) */
+ #define E17_BC_BADVEC	10	/* last unexpected vector (handle_badint)      */
+ #define E17_BC_CPU1PC	11	/* CPU1 interrupted PC at its last AP tick (4 bytes, BE) */
++#define E17_BC_CPU0LICR2 15	/* CPU0 tick source (VIC LICR2) snapshot from CPU1's tick */
++#define E17_BC_SSCR0	16	/* VIC SSCR0 (tick enable/freq) snapshot from CPU1's tick */
+ #define E17_BC_VALID	0xe1	/* E17_BC_LEN comes from <linux/e17_breadcrumb.h> */
+ 
+ static u8 e17_bc_prev[E17_BC_LEN];
+@@ -645,12 +693,19 @@ static irqreturn_t e17_timer_int(int irq, void *dev_id)
  	 */
  	E17_BC[E17_BC_IRQERR] = atomic_read(&irq_err_count);
  	/*
@@ -88,7 +96,69 @@ index 90ce534eb85e..b71b9bca0915 100644
  	legacy_timer_tick(1);
  #ifdef CONFIG_SMP
  	/*
-@@ -861,9 +915,13 @@ static void __init eltec_e17_init_IRQ(void)
+@@ -699,7 +754,7 @@ static irqreturn_t e17_timer_int(int irq, void *dev_id)
+ static void e17_ap_vicclk_disable(const char *why, unsigned int peak_fpj,
+ 				  unsigned int vicirq_stuck)
+ {
+-	writeb(E17_SICF_VICCLK_DIS, (void __iomem *)E17_CPU2CON);
++	e17_cpu2con_write(E17_SICF_VICCLK_DIS);
+ 	pr_warn_ratelimited("E17 SMP: AP VIC-clock %s (peak ~%u/jiffy, VICIRQ-set-after-ack x%u -> %s) -- DISABLED (AP tick lost, board stays alive)\n",
+ 			    why, peak_fpj, vicirq_stuck,
+ 			    vicirq_stuck ? "ack does not clear a level-held source"
+@@ -714,15 +769,38 @@ static irqreturn_t e17_ap_tick(int irq, void *dev_id)
+ 	if (smp_processor_id() == 0)		/* only the secondary owns this tick */
+ 		return IRQ_NONE;
+ 
+-	/* Ack first so the source de-asserts regardless of what we do below. */
+-	writeb(E17_SICF_IACK_VIC, (void __iomem *)E17_CPU2CON);
+-
+-	/* Mechanism probe: VICIRQ still set after ack == ack-refire (level-held). */
+-	if (readb((void __iomem *)E17_CPU2CON) & E17_CPU2CON_VICIRQ)
++	/*
++	 * Ack first so the source de-asserts regardless of what we do below, and
++	 * read back the VICIRQ probe atomically - both under the shared IPI-reg
++	 * lock so CPU0's SIPL doorbell write cannot land between them.
++	 */
++	if (e17_cpu2con_ack_probe(E17_SICF_IACK_VIC) & E17_CPU2CON_VICIRQ)
+ 		vicirq_stuck++;
+ 
+ 	E17_BC[E17_BC_HB1]++;			/* breadcrumb: CPU1 tick alive (cheap) */
+ 
++	/*
++	 * Snapshot CPU0's tick source (VIC LICR2 / SSCR0) only when CPU0 looks
++	 * stalled - its heartbeat HB0 has not advanced across several CPU1 ticks.
++	 * Doing this every tick means two extra NVRAM writes per tick on CPU1's
++	 * hot path, and the battery-SRAM writes are slow enough on the shared
++	 * local bus to themselves destabilise the fragile AP tick.  Stall-only
++	 * keeps the hot path cheap while still capturing the state at the wedge.
++	 */
++	{
++		static u8 last_hb0, stall;
++
++		if (E17_BC[E17_BC_HB0] == last_hb0) {
++			if (stall < 255 && ++stall == 3) {
++				E17_BC[E17_BC_CPU0LICR2] = e17_vic[E17_VIC_LICR2];
++				E17_BC[E17_BC_SSCR0]     = e17_vic[E17_VIC_SSCR0];
++			}
++		} else {
++			last_hb0 = E17_BC[E17_BC_HB0];
++			stall = 0;
++		}
++	}
++
+ 	/* Jiffies-independent runaway catch (works even if CPU0's tick is frozen). */
+ 	if (++e17_aptick_fires > E17_APTICK_RUNAWAY) {
+ 		e17_ap_vicclk_disable("runaway (CPU0 tick frozen?)", peak_fpj,
+@@ -776,7 +854,7 @@ static irqreturn_t e17_ap_tick(int irq, void *dev_id)
+ /* Called on the SECONDARY CPU (secondary_start_kernel) to start its own tick. */
+ void e17_ap_tick_enable(void)
+ {
+-	writeb(E17_SICF_VICCLK_EN, (void __iomem *)E17_CPU2CON);
++	e17_cpu2con_write(E17_SICF_VICCLK_EN);
+ }
+ #endif
+ 
+@@ -861,9 +939,13 @@ static void __init eltec_e17_init_IRQ(void)
  
  void __init config_eltec_e17(void)
  {
@@ -113,6 +183,115 @@ index fe47ec0cf2cc..e6bbaaac411f 100644
  int eltec_e17_parse_bootinfo(const struct bi_record *record);
  
  #ifdef CONFIG_SMP
+diff --git a/arch/m68k/eltec/smp_e17.c b/arch/m68k/eltec/smp_e17.c
+index 393d51e4f068..94ffe005d561 100644
+--- a/arch/m68k/eltec/smp_e17.c
++++ b/arch/m68k/eltec/smp_e17.c
+@@ -573,6 +573,45 @@ void e17_smp_disable_snoop(unsigned int cpu)
+ /* Inter-processor interrupt: ring + acknowledge.                            */
+ /* ------------------------------------------------------------------------- */
+ 
++/*
++ * Both inter-processor doorbell registers are shared between the CPUs and have
++ * per-CPU (primary vs secondary) bit meanings, so a write from one CPU that
++ * races a write from the other corrupts state (HW manual: cross-CPU CPU2CON
++ * access is unsafe).  The victims:
++ *   - CPU2CON (0xfec58000): CPU0 writes SIPL to ring CPU1; CPU1 writes SICF
++ *     every tick (VIC-clock ack) and to ack the mailbox IPI.
++ *   - VIC ICFSR (0xfec0105f): CPU1 writes the ICMS edge to ring CPU0; CPU0
++ *     read-modify-writes it to ack.
++ * Serialise every runtime access to either with one raw lock.  The critical
++ * sections are a single byte access (or a two-access RMW), and no path holds
++ * the lock while waiting for the other CPU (e17_send_ipi rings and returns; the
++ * caller waits afterwards), so there is no cross-CPU deadlock.  irqsave because
++ * the AP VIC-clock tick (hard IRQ) is one of the writers.
++ */
++DEFINE_RAW_SPINLOCK(e17_smp_reg_lock);
++
++void e17_cpu2con_write(u8 val)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&e17_smp_reg_lock, flags);
++	writeb(val, (void __iomem *)E17_CPU2CON);
++	raw_spin_unlock_irqrestore(&e17_smp_reg_lock, flags);
++}
++
++/* Write CPU2CON and read it back atomically (the AP tick's VICIRQ probe). */
++u8 e17_cpu2con_ack_probe(u8 val)
++{
++	unsigned long flags;
++	u8 r;
++
++	raw_spin_lock_irqsave(&e17_smp_reg_lock, flags);
++	writeb(val, (void __iomem *)E17_CPU2CON);
++	r = readb((void __iomem *)E17_CPU2CON);
++	raw_spin_unlock_irqrestore(&e17_smp_reg_lock, flags);
++	return r;
++}
++
+ void e17_send_ipi(const struct cpumask *mask, unsigned int ipi_msg)
+ {
+ 	unsigned int cpu;
+@@ -598,14 +637,18 @@ void e17_send_ipi(const struct cpumask *mask, unsigned int ipi_msg)
+ 		 */
+ 		if (IS_ENABLED(CONFIG_E17_SMP_HW_IPI)) {
+ 			if (cpu == 1) {
+-				writeb(E17_CPU2CON_SRESET | E17_IPI_SEC_IPL,
+-				       (void __iomem *)E17_CPU2CON);
++				e17_cpu2con_write(E17_CPU2CON_SRESET |
++						  E17_IPI_SEC_IPL);
+ 			} else {
+ 				void __iomem *icfsr = (void __iomem *)E17_VIC_ICFSR;
+-				u8 v = readb(icfsr) & ~E17_ICMS_IPI_SW;
++				unsigned long flags;
++				u8 v;
+ 
++				raw_spin_lock_irqsave(&e17_smp_reg_lock, flags);
++				v = readb(icfsr) & ~E17_ICMS_IPI_SW;
+ 				writeb(v, icfsr);			/* ensure 0    */
+ 				writeb(v | E17_ICMS_IPI_SW, icfsr);	/* 0 -> 1 edge */
++				raw_spin_unlock_irqrestore(&e17_smp_reg_lock, flags);
+ 			}
+ 		}
+ 	}
+@@ -615,12 +658,15 @@ void e17_ipi_ack_self(void)
+ {
+ 	if (smp_processor_id() == 1) {
+ 		/* secondary: SICF=101 IACKs the mailbox IRQ, clears SIPL+MIPEND */
+-		writeb(E17_SICF_IACK_MBOX, (void __iomem *)E17_CPU2CON);
++		e17_cpu2con_write(E17_SICF_IACK_MBOX);
+ 	} else {
+ 		/* primary: drop our ICMS module-switch bit so the next edge is seen */
+ 		void __iomem *icfsr = (void __iomem *)E17_VIC_ICFSR;
++		unsigned long flags;
+ 
++		raw_spin_lock_irqsave(&e17_smp_reg_lock, flags);
+ 		writeb(readb(icfsr) & ~E17_ICMS_IPI_SW, icfsr);
++		raw_spin_unlock_irqrestore(&e17_smp_reg_lock, flags);
+ 	}
+ }
+ 
+diff --git a/arch/m68k/include/asm/smp_e17.h b/arch/m68k/include/asm/smp_e17.h
+index b18742abd92e..663a3caa4e21 100644
+--- a/arch/m68k/include/asm/smp_e17.h
++++ b/arch/m68k/include/asm/smp_e17.h
+@@ -228,6 +228,15 @@ void e17_smp_init_cpus(void);
+ int  e17_boot_secondary(unsigned int cpu, struct task_struct *idle);
+ void e17_send_ipi(const struct cpumask *mask, unsigned int ipi_msg);
+ void e17_ipi_ack_self(void);		/* ack the local doorbell after draining */
++
++/*
++ * Serialised access to the shared inter-processor registers (CPU2CON, VIC
++ * ICFSR): the doorbell writes from the two CPUs race and corrupt each other
++ * otherwise.  Use these from any CPU2CON writer (config.c's AP tick too).
++ */
++extern raw_spinlock_t e17_smp_reg_lock;
++void e17_cpu2con_write(u8 val);
++u8 e17_cpu2con_ack_probe(u8 val);	/* write + atomic read-back */
+ void e17_smp_enable_snoop(unsigned int cpu);
+ void e17_smp_disable_snoop(unsigned int cpu);
+ void e17_park_secondary(void);		/* stop #0x2700 park (offline/stop)      */
 diff --git a/arch/m68k/kernel/head.S b/arch/m68k/kernel/head.S
 index e0e271349fcd..db8c3315fbb4 100644
 --- a/arch/m68k/kernel/head.S
@@ -442,7 +621,7 @@ index 07fa8ac13d12..796b1a777c4b 100644
  
  static int e17_cd2401_console_setup(struct console *co, char *options)
 diff --git a/drivers/watchdog/e17_wdt.c b/drivers/watchdog/e17_wdt.c
-index 07e676eb62c6..e1a934a9b6cf 100644
+index 07e676eb62c6..c4827aba82c5 100644
 --- a/drivers/watchdog/e17_wdt.c
 +++ b/drivers/watchdog/e17_wdt.c
 @@ -200,11 +200,23 @@ static int e17_wdt_probe(struct platform_device *pdev)
@@ -472,6 +651,35 @@ index 07e676eb62c6..e1a934a9b6cf 100644
  		/*
  		 * Pre-reset breadcrumb (arch/m68k/eltec/config.c).  bc[1]=CPU0 tick
  		 * heartbeat, bc[2]=CPU1 tick heartbeat, bc[3]=CPU1's heartbeat at CPU0's
+@@ -236,6 +248,15 @@ static int e17_wdt_probe(struct platform_device *pdev)
+ 			 */
+ 			dev_warn(dev, "  CPU1 last-tick PC 0x%08x (%pS)\n",
+ 				 cpu1_pc, (void *)(unsigned long)cpu1_pc);
++			/*
++			 * CPU0's tick source (VIC LICR2) and the VIC tick timer
++			 * control (SSCR0), snapshotted from CPU1's tick.  If CPU0's
++			 * tick stopped, LICR2 bit7 (0x80) set = its VIC line got
++			 * masked; a changed SSCR0 = the timer was disabled/reprogrammed.
++			 */
++			dev_warn(dev, "  CPU0 tick src: LICR2=0x%02x (%s), SSCR0=0x%02x\n",
++				 bc[15], (bc[15] & 0x80) ? "MASKED" : "unmasked",
++				 bc[16]);
+ 		}
+ 	}
+ 
+diff --git a/include/linux/e17_breadcrumb.h b/include/linux/e17_breadcrumb.h
+index 26641312e09e..a7b57f62d6a9 100644
+--- a/include/linux/e17_breadcrumb.h
++++ b/include/linux/e17_breadcrumb.h
+@@ -13,7 +13,7 @@
+ 
+ #include <linux/types.h>
+ 
+-#define E17_BC_LEN		15	/* MAGIC,HB0,HB1,HB1_SNAP,PHASE,PC[4],IRQERR,BADVEC,CPU1PC[4] */
++#define E17_BC_LEN		17	/* ...,CPU1PC[4],CPU0LICR2,SSCR0 */
+ 
+ /* PHASE codes (0 = not in any marked region). */
+ #define E17_BC_PH_NONE		0x00
 diff --git a/include/linux/e17_wdt.h b/include/linux/e17_wdt.h
 new file mode 100644
 index 000000000000..8ed3dd300e65
