@@ -245,3 +245,21 @@ but QEMU is where the `e17` machine lives, so without that fork there is
 nothing to run the ROM on. The ROM, the register documentation in the README
 and the tools here are enough to re-derive the model; the forks are a
 convenience, not a secret ingredient.
+
+### Patches for the other trees
+
+`patches/` holds fixes that belong to the U-Boot or QEMU forks but were
+produced here, as standalone patches against those trees' committed state.
+They are kept separate rather than committed directly because the working
+trees on the development machine carry unrelated work in progress.
+
+* `e17-cd2401-quiesce.patch` — stop an early keypress from hanging U-Boot.
+  RMON owns the CD2401 until the moment it hands over, receiver and interrupts
+  enabled, so a character arriving during the handover latches a service
+  request nobody acknowledges. The chip then refuses channel commands, and the
+  `while (CCR != 0)` poll in `serial_cd2401_probe()` never finishes — U-Boot
+  never reaches a prompt. The patch adds `cd2401_quiesce()`, called from
+  `cpu_init_f()` (the first point at which the I/O window is mapped) and again
+  from probe, which unwinds any receive/transmit/modem service context, drains
+  the FIFO, and silences all four channels. It also bounds the CCR poll so a
+  future surprise reports itself instead of hanging silently.

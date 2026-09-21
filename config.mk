@@ -66,7 +66,7 @@ ROOTFS_INIT ?= nolibc
 MQTT_BROKER ?= 192.168.3.2
 MQTT_TOPIC  ?= m68k/e17/serial
 # The lab's TFTP root, served by smolmqtt's file2mqtt (see docs/TESTING.md).
-MQTT_FILE_TOPIC ?= m68k/e17/file
+MQTT_FILE_TOPIC ?= m68k/e17/files
 MQTTFILE    ?= /workspace/src/smolmqtt/mqttfile
 # The booted kernel's telnetd, which is how commands get in (the serial
 # console is output-only once Linux is up).

@@ -1,0 +1,246 @@
+diff --git a/board/eltec/e17/dummy.c b/board/eltec/e17/dummy.c
+index f1ecda5..02ec96d 100644
+--- a/board/eltec/e17/dummy.c
++++ b/board/eltec/e17/dummy.c
+@@ -10,6 +10,8 @@
+ #include <linux/string.h>
+ #include <asm/bootinfo.h>
+ #include <asm/processor.h>
++#include <asm/io.h>
++#include <asm/e17/e17.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -65,6 +67,23 @@ void cpu_init_f(void)
+ 		"cinva   %%bc\n\t"		/* invalidate both caches: drop RMON's stale lines */
+ 		"nop\n\t"
+ 		: : : "d0");
++
++	/*
++	 * Silence the UART the monitor was still driving, before anything
++	 * else can touch it.
++	 *
++	 * RMON owns the CD2401 right up to the handover, receiver and
++	 * interrupts enabled.  A character that lands in the gap latches a
++	 * service request nobody acknowledges, and the chip then refuses
++	 * channel commands - so the CCR poll in the serial driver's probe
++	 * never completes and u-boot never reaches a prompt.  That was the
++	 * old "type a key too early and it hangs".
++	 *
++	 * This is the first point where it can be done: the transparent
++	 * translations set up just above are what make the 0xfec00000 I/O
++	 * window reachable at all.
++	 */
++	cd2401_quiesce((void *)E17_SERIAL, (void *)E17_SERIAL_IACK);
+ }
+ 
+ int dram_init(void)
+diff --git a/drivers/serial/serial_cd2401.c b/drivers/serial/serial_cd2401.c
+index 2fa0739..c63190c 100644
+--- a/drivers/serial/serial_cd2401.c
++++ b/drivers/serial/serial_cd2401.c
+@@ -2,8 +2,6 @@
+ /*
+  */
+ 
+-#define DEBUG 1
+-
+ #include <clk.h>
+ #include <debug_uart.h>
+ #include <dm.h>
+@@ -122,6 +120,7 @@ static bool serial_cd2401_irq_line_asserted(const struct serial_cd2401_priv *pri
+ }
+ 
+ #define CD2401_IRQ_ASSERT_LOOPS (1 << 16)
++#define CD2401_CCR_WAIT_LOOPS	(1 << 16)
+ 
+ #define cd2401_ack_timeout for (unsigned int i = CD2401_IRQ_ASSERT_LOOPS; i > 0; cd2401_irq_delay(), i--)
+ 
+@@ -179,7 +178,7 @@ static int serial_cd2401_write_tx(struct udevice *dev, const u8* data, unsigned
+ {
+ 	struct serial_cd2401_priv *priv = dev_get_priv(dev);
+ 	unsigned int cnt;
+-	int written, ret;
++	int ret;
+ 
+ 	serial_cd2401_select_chan(priv, 0);
+ 	serial_cd2401_enable_tx_irqs(priv);
+@@ -358,8 +357,16 @@ static int serial_cd2401_probe(struct udevice *dev)
+ 	priv->rx_head = 0;
+ 	priv->rx_tail = 0;
+ 
++	/*
++	 * cpu_init_f() already did this at takeover, but a character can have
++	 * arrived since - between there and here u-boot prints its banner,
++	 * sizes DRAM and relocates, which is plenty of time at 9600 baud.  An
++	 * unacknowledged service request would wedge the CCR poll below.
++	 */
++	cd2401_quiesce(priv->base, (void *)E17_SERIAL_IACK);
++
+ 	/* clean up other channels */
+-	for (int i = 1; i < 3; i++) {
++	for (int i = 1; i < CD2401_NR_CHANNELS; i++) {
+ 		serial_cd2401_select_chan(priv, i);
+ 		serial_cd2401_disable_irqs(priv);
+ 		writeb(i << 2, priv->base + CD2401_LIV);
+@@ -384,10 +391,18 @@ static int serial_cd2401_probe(struct udevice *dev)
+ 	writeb(CD2401_RX_IPL, priv->base + CD2401_RPILR);
+ 
+ 	/*
+-	 * Wait for any in-progress command to complete,
+-	 * not that there should be a command running...
++	 * Wait for any in-progress command to complete, but do not wait
++	 * forever: if the chip is somehow still holding a service request
++	 * this never clears, and an unbounded spin here is a silent hang
++	 * with no console to report it.  Carrying on gives the rest of
++	 * probe - and the error path - a chance to say something.
+ 	 */
+-	while(serial_cd2401_read_reg(priv, CD2401_CCR) != 0) {
++	for (int i = CD2401_CCR_WAIT_LOOPS; i; i--) {
++		if (serial_cd2401_read_reg(priv, CD2401_CCR) == 0)
++			break;
++		cd2401_irq_delay();
++		if (i == 1)
++			printf("cd2401: CCR still busy, continuing anyway\n");
+ 	}
+ 
+ 	writeb(CD2401_CCR_ENBRX | CD2401_CCR_ENBXMTR,
+diff --git a/include/cd2401.h b/include/cd2401.h
+index dde1688..8e3bad2 100644
+--- a/include/cd2401.h
++++ b/include/cd2401.h
+@@ -19,22 +19,36 @@
+ #define CD2401_REOIR_NOTRANS BIT(3)
+ #define CD2401_TEOIR		0x85
+ #define CD2401_TEOIR_NOTRANS BIT(3)
++#define CD2401_MEOIR		0x86
++#define CD2401_MEOIR_NOTRANS BIT(3)
+ #define CD2401_RISRH		0x88
+ #define CD2401_RISRL		0x89
+ #define CD2401_TISR			0x8a
+ #define CD2401_TISR_TXEMPTY BIT(1)
+ #define CD2401_TPILR		0xe0
+ #define CD2401_RPILR		0xe1
++#define CD2401_MPILR		0xe3
+ #define CD2401_TIR			0xec
+ #define CD2401_TIR_TACT		BIT(6)
+ #define CD2401_RIR			0xed
+ #define CD2401_RIR_RACT		BIT(6)
+ #define CD2401_RIR_REN		BIT(7)
++#define CD2401_MIR			0xef
++#define CD2401_MIR_MACT		BIT(6)
++#define CD2401_MIR_MEN		BIT(7)
+ #define CD2401_CAR			0xee
+ #define CD2401_TDR			0xf8
+ #define CD2401_RDR			CD2401_TDR
+ 
+ #define CD2401_FIFO_SZ		16
++#define CD2401_NR_CHANNELS	4
++
++/*
++ * Every one of the three interrupt registers (RIR/TIR/MIR) reports a pending
++ * request in bit 7 and an in-progress service in bit 6.
++ */
++#define CD2401_IR_PENDING	BIT(7)
++#define CD2401_IR_ACTIVE	BIT(6)
+ 
+ #define CD2401_VECTOR_TYPE_MASK		0x3
+ #define CD2401_VECTOR_TYPE_RXEXCP	0b00
+@@ -52,6 +66,97 @@ static inline unsigned int cd2401_vector_type(u8 vector)
+ {
+ 	return (vector & CD2401_VECTOR_TYPE_MASK);
+ }
++
++/*
++ * Enter the service context for one interrupt type, if there is anything to
++ * service.  Returns 1 when the chip is in that context and the caller must
++ * finish with the matching End Of Interrupt.
++ *
++ * `ir` is RIR/TIR/MIR and `pilr` the matching priority-interrupt-level
++ * register.  A request that is merely pending has to be acknowledged before
++ * the context is entered, which on this board is a read of the software-IACK
++ * window at the level the PILR currently holds.  We only ever do that read
++ * when bit 7 says a request really is outstanding: a bus cycle nobody answers
++ * hangs the board hard, so blind acknowledges are not an option.
++ */
++static inline int cd2401_enter_service(void *base, void *iack, u8 ir, u8 pilr)
++{
++	u8 v = readb(base + ir);
++	u8 ipl;
++
++	if (!(v & (CD2401_IR_PENDING | CD2401_IR_ACTIVE)))
++		return 0;
++	if (v & CD2401_IR_ACTIVE)
++		return 1;
++
++	ipl = readb(base + pilr);
++	if (!ipl)
++		return 0;		/* level 0: no way in, leave it alone */
++
++	(void)readb(iack + ipl);
++
++	return !!(readb(base + ir) & CD2401_IR_ACTIVE);
++}
++
++/*
++ * Put the chip back into its background context, whatever state the previous
++ * owner left it in, and silence every channel.
++ *
++ * This matters at takeover.  The monitor ROM drives this UART right up to the
++ * moment it hands over, with the receiver and its interrupts enabled, so a
++ * character arriving during the handover latches a service request that the
++ * new owner never acknowledges: the chip asserts its interrupt line and waits.
++ * While a request is outstanding it will not accept a channel command either,
++ * so the CCR poll in serial_cd2401_probe() spins forever - which is why
++ * pressing a key too early used to stop u-boot from ever coming up.
++ *
++ * Unwinding it has to be done in the chip's own terms, one service type at a
++ * time, because RDR may only be touched inside the receive context and a
++ * latched receive exception re-asserts the interrupt until RISR is read.  A
++ * few passes, since another character can land while we work.
++ */
++static inline void cd2401_quiesce(void *base, void *iack)
++{
++	int pass, i;
++
++	for (pass = 0; pass < 4; pass++) {
++		int busy = 0;
++
++		/* Modem: nothing to collect, just leave the context. */
++		if (cd2401_enter_service(base, iack, CD2401_MIR, CD2401_MPILR)) {
++			writeb(CD2401_MEOIR_NOTRANS, base + CD2401_MEOIR);
++			busy = 1;
++		}
++
++		/* Transmit: NOTRANS, so the chip sends nothing on our way out. */
++		if (cd2401_enter_service(base, iack, CD2401_TIR, CD2401_TPILR)) {
++			writeb(CD2401_TEOIR_NOTRANS, base + CD2401_TEOIR);
++			busy = 1;
++		}
++
++		/* Receive: clear the latched status, then discard the FIFO. */
++		if (cd2401_enter_service(base, iack, CD2401_RIR, CD2401_RPILR)) {
++			unsigned int n;
++
++			(void)readb(base + CD2401_RISRH);
++			(void)readb(base + CD2401_RISRL);
++			n = readb(base + CD2401_RFOC);
++			for (i = 0; i < (int)n && i < CD2401_FIFO_SZ; i++)
++				(void)readb(base + CD2401_RDR);
++			writeb(0, base + CD2401_REOIR);
++			busy = 1;
++		}
++
++		if (!busy)
++			break;
++	}
++
++	/* Nothing is in service now, so the per-channel banking is ours. */
++	for (i = 0; i < CD2401_NR_CHANNELS; i++) {
++		writeb(i, base + CD2401_CAR);
++		writeb(0, base + CD2401_IER);
++	}
++}
+ #endif
+ 
+ #endif
