@@ -99,7 +99,7 @@ static int spawn_console_shell(void)
 		char *sh[] = { "-sh", 0 };	/* leading '-' => login shell */
 
 		console_ctty();
-		execve("/bin/sh", sh, sh_env);
+		execve("/bin/smolsh", sh, sh_env);
 		_exit(127);
 	}
 	return pid;
@@ -112,6 +112,20 @@ int main(void)
 	mount("dev", "/dev", "devtmpfs", 0, 0);
 	mkdir("/dev/pts", 0755);
 	mount("devpts", "/dev/pts", "devpts", 0, 0);	/* ptys for telnetd */
+
+	/*
+	 * Reboot on an RCU stall rather than limp.  The hardware watchdog only
+	 * rescues a board whose tick has stopped outright; a half-wedged board
+	 * (one CPU dead, timers erratic) keeps petting it while being useless -
+	 * answering pings, no console input, no way back in.  An RCU stall is the
+	 * earliest reliable signal of that, and panicking on it (with panic=10 in
+	 * bootargs) turns the state back into a clean reboot.  This is a sysctl,
+	 * not a boot arg (the boot arg form is rejected as unknown).
+	 */
+	{
+		int fd = open("/proc/sys/kernel/panic_on_rcu_stall", O_WRONLY);
+		if (fd >= 0) { write(fd, "1\n", 2); close(fd); }
+	}
 
 	put("\n================================================\n");
 	put(" ELTEC Eurocom E17 - Linux/m68k SMP (dual 68040)\n");
@@ -130,27 +144,18 @@ int main(void)
 	put("--- /proc/interrupts (ap-tick=CPU1 VIC-clock, ipi-mailbox=CPU1) ---\n");
 	cat("/proc/interrupts");
 
-	/* Make BusyBox applets available as /bin/<applet> (best effort). */
-	{
-		char *iarg[] = { "/bin/busybox", "--install", "-s", "/bin", 0 };
-
-		spawn_wait(iarg);
-	}
-
-	/* eth0 is configured by the kernel (ip= boot arg); just show it. */
-	put("--- network (eth0, configured by kernel ip= boot arg) ---\n");
-	{
-		char *ifc[] = { "/bin/busybox", "ifconfig", "eth0", 0 };
-
-		spawn_wait(ifc);
-	}
-
-	/* Start telnetd on port 23 (busybox telnetd daemonizes itself). */
+	/*
+	 * Start telnetd.  This is the only way in: once Linux is up the CD2401
+	 * console is output-only, so without it the board can be watched but
+	 * not driven.  smolutils' telnetd serves /bin/smolsh and does not
+	 * daemonize, hence spawn_nowait().
+	 */
 	put("--- starting telnetd on port 23 (telnet in for a shell) ---\n");
+	int tdpid;
 	{
-		char *td[] = { "/bin/busybox", "telnetd", "-l", "/bin/sh", 0 };
+		char *td[] = { "/bin/telnetd", 0 };
 
-		spawn_nowait(td);
+		tdpid = spawn_nowait(td);
 	}
 
 	put("--- E17 SMP up; starting shell on /dev/console ---\n\n");
@@ -166,8 +171,8 @@ int main(void)
 			char *sh[] = { "-sh", 0 };
 
 			console_ctty();
-			execve("/bin/sh", sh, sh_env);
-			put("--- exec /bin/sh failed; PID1 parked ---\n");
+			execve("/bin/smolsh", sh, sh_env);
+			put("--- exec /bin/smolsh failed; PID1 parked ---\n");
 			for (;;)
 				sleep(3600);
 		}
@@ -188,6 +193,20 @@ int main(void)
 			if (w == shpid) {
 				put("\n[init] console shell exited; respawning...\n");
 				shpid = spawn_console_shell();
+			}
+			/*
+			 * Respawn telnetd too.  While the console is output-only it
+			 * is the only way to drive the board, so letting it stay
+			 * dead strands the machine completely: reachable by ping,
+			 * impossible to log into, and still ticking so the watchdog
+			 * never rescues it either.  That has already cost one
+			 * debugging session.
+			 */
+			if (w == tdpid) {
+				char *td[] = { "/bin/telnetd", 0 };
+
+				put("\n[init] telnetd exited; respawning...\n");
+				tdpid = spawn_nowait(td);
 			}
 		}
 	}

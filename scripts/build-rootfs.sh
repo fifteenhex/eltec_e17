@@ -19,6 +19,8 @@
 . "$(dirname "$0")/lib.sh"
 
 LINUX="$(resolve_src linux)"
+SMOLUTILS="${SMOLUTILS:-/workspace/src/smolutils}"
+NLEXT="${NLEXT:-/workspace/src/nolibc-extensions}"
 OUT="$BUILD/rootfs"
 ROOT="$OUT/root"
 CPIO="$OUT/e17-rootfs.cpio"
@@ -28,7 +30,7 @@ need_cross
 have cpio || die "missing 'cpio' - run 'make deps'"
 
 rm -rf "$ROOT"
-mkdir -p "$ROOT"/{bin,sbin,dev,proc,sys,root} "$OUT"
+mkdir -p "$ROOT"/{bin,sbin,dev,proc,sys,root,run,tmp,etc} "$OUT"
 
 # ---- kernel headers + gen_init_cpio (host tool) -----------------------------
 
@@ -78,9 +80,48 @@ busybox)
 	;;
 esac
 
-# ---- BusyBox ----------------------------------------------------------------
+# ---- smolutils --------------------------------------------------------------
+#
+# The userspace is smolutils rather than BusyBox: it is built against the same
+# nolibc (plus nolibc-extensions for the sockets nolibc lacks), so it needs no
+# target libc at all, and it is small enough not to bloat the netboot image.
+# telnetd matters most - with Linux up, the CD2401 console is output-only, so
+# it is the only way to drive the board.
 
-if cross_has_libc; then
+# getty is not optional: telnetd spawns /sbin/getty for every session, so
+# without it a telnet connection is accepted and then silently dies with no
+# shell - which, when the serial console is output-only, means no way into the
+# board at all.
+SMOL_PROGS="${SMOL_PROGS:-smolsh telnetd getty cat ls ps dmesg uname df mount kill touch tftp}"
+
+if [ -d "$SMOLUTILS" ] && [ -d "$NLEXT/include" ]; then
+	say "building smolutils userspace ($SMOL_PROGS)"
+	for p in $SMOL_PROGS; do
+		[ -f "$SMOLUTILS/$p.c" ] || { warn "no $p.c in $SMOLUTILS"; continue; }
+		"${CROSS}gcc" -include "$LINUX/tools/include/nolibc/nolibc.h" \
+			-include "$NLEXT/include/nolibc-extensions.h" \
+			-Wl,--hash-style=gnu \
+			-Werror=return-type -Werror=implicit-function-declaration \
+			-nostdlib -std=c99 -Os -m68040 -static \
+			-I"$KINC" -I"$NLEXT/include" \
+			-o "$ROOT/bin/$p" "$SMOLUTILS/$p.c" -lgcc ||
+			die "failed to build smolutils/$p.c"
+		"${CROSS}strip" "$ROOT/bin/$p"
+	done
+	ln -sf smolsh "$ROOT/bin/sh"
+	# telnetd execs it by absolute path.
+	if [ -x "$ROOT/bin/getty" ]; then
+		mkdir -p "$ROOT/sbin"
+		mv "$ROOT/bin/getty" "$ROOT/sbin/getty"
+	fi
+else
+	warn "no smolutils at $SMOLUTILS (or nolibc-extensions at $NLEXT):
+  the image will have no shell and no telnetd, so the board cannot be driven."
+fi
+
+# ---- BusyBox (legacy, needs a libc) -----------------------------------------
+
+if [ "${ROOTFS_BUSYBOX:-0}" = 1 ] && cross_has_libc; then
 	BB="$BUILD/busybox/busybox-$BUSYBOX_VERSION"
 	if [ ! -x "$BB/busybox" ]; then
 		mkdir -p "$BUILD/busybox" "$BUILD/dl"
@@ -101,9 +142,8 @@ if cross_has_libc; then
 	fi
 	install -m 0755 "$BB/busybox" "$ROOT/bin/busybox"
 	ln -sf busybox "$ROOT/bin/sh"
-else
-	warn "${CROSS}gcc cannot link a libc - skipping BusyBox.
-  The nolibc init still works; install libc6-dev-m68k-cross for a shell."
+elif [ "${ROOTFS_BUSYBOX:-0}" = 1 ]; then
+	warn "${CROSS}gcc cannot link a libc - skipping BusyBox."
 fi
 
 # ---- pack -------------------------------------------------------------------

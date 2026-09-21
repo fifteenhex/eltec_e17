@@ -253,13 +253,22 @@ produced here, as standalone patches against those trees' committed state.
 They are kept separate rather than committed directly because the working
 trees on the development machine carry unrelated work in progress.
 
-* `e17-cd2401-quiesce.patch` — stop an early keypress from hanging U-Boot.
-  RMON owns the CD2401 until the moment it hands over, receiver and interrupts
-  enabled, so a character arriving during the handover latches a service
-  request nobody acknowledges. The chip then refuses channel commands, and the
-  `while (CCR != 0)` poll in `serial_cd2401_probe()` never finishes — U-Boot
-  never reaches a prompt. The patch adds `cd2401_quiesce()`, called from
-  `cpu_init_f()` (the first point at which the I/O window is mapped) and again
-  from probe, which unwinds any receive/transmit/modem service context, drains
-  the FIFO, and silences all four channels. It also bounds the CCR poll so a
-  future surprise reports itself instead of hanging silently.
+* `e17-uboot-uart-watchdog.patch` — the current, comprehensive U-Boot patch
+  (supersedes `e17-cd2401-quiesce.patch`). It covers:
+  - the CD2401 serial rewrite: one shared priority level for all three service
+    types, software-IACK at the single `0x7b` window, and dispatch on the
+    returned vector type — so echoing a typed line (receive outranks transmit
+    inside the chip) can no longer issue an IACK at a level nothing answers,
+    which was the "type a word and the board dies" hang;
+  - `cd2401_quiesce()` at handover, so a character arriving from RMON cannot
+    leave a latched service request that wedges probe;
+  - arming the board watchdog in `cpu_init_f()` and petting it (schedule(),
+    early `board_r`, and directly in the CD2401 poll loops), so a wedge during
+    early init recovers by itself;
+  - `bootdelay=-1` and a default `bootfile=e17/...` so the board lands at the
+    prompt and a bare `run netboot` boots the kernel under test;
+  - bootargs `e17_idle=spin panic_on_rcu_stall=1 panic=10` (see the kernel-side
+    lockup notes in the README).
+
+* `e17-cd2401-quiesce.patch` — the earlier, narrower fix (early-keypress hang
+  only); kept for history. Use the comprehensive patch above instead.

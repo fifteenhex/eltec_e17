@@ -1,0 +1,177 @@
+ELTEC EUROCOM-17 - hardware session 2026-09-21 (UART + watchdog + first lockup post-mortem)
+==========================================================================================
+
+Access: RMON -> our u-boot (netbooted as e17/u-boot.e17boot) -> netboot Linux.
+Console over serial2mqtt (m68k/e17/serial); files over file2mqtt (m68k/e17/files).
+
+
+1. U-BOOT UART - FIXED AND VERIFIED
+-----------------------------------
+Four distinct bugs, all found on hardware:
+
+ a. A bit-7 "request pending" flag was invented for TIR/RIR. It does not exist:
+    the working kernel driver defines only TIR_TACT (0x40, bit 6 = service
+    active) and never reads bit 7. The ack loop therefore never issued the
+    software IACK, every putc dropped its character, and the console went
+    silent. Fixed by following the kernel driver: one shared priority level for
+    all three services, IACK at the single 0x7b window, dispatch on the returned
+    vector type rather than the one wanted.
+
+ b. TX and RX were given different PILR levels. With a character waiting the
+    chip favours receive, so an IACK at the transmit level matched no PILR, went
+    un-DTACKed, and stalled the bus (no bus-error timeout on this board). This
+    was the original "type a word at the prompt and the board dies".
+
+ c. A 1.665 s unpetted window across relocation into initr_dm, against the
+    1.6 s watchdog period -> a HEALTHY board reset 65 ms short of "Now running
+    in RAM". Fixed with early WATCHDOG_RESET() in board_r and direct pets in the
+    CD2401 poll loops.
+
+ d. lz4 -9 defaults to 4 MB blocks; u-boot's lz4 wrapper pets once per frame
+    block, so the 3.9 MB kernel was ONE 18 s unpetted decompress. Fixed in
+    packaging with -B4 (64 KB blocks); ~6% larger.
+
+Verified on hardware: `version` (7 chars, the command that hung the old build),
+a 60-char paste through the 16-byte FIFO, and five rapid commands incl. bdinfo -
+all echoed and executed cleanly.
+
+
+2. WATCHDOG SELF-RECOVERY - WORKING
+-----------------------------------
+u-boot now arms the board watchdog ($FEC5.0000) in cpu_init_f, before the serial
+probe (the fragile part), and pets from schedule() + board_r. RMON prints
+"### Watchdog Reset" and reloads automatically. Observed the board recover from a
+Linux hang to a u-boot prompt unattended, repeatedly. The hardware cannot be
+disarmed once armed, so the kernel now MUST pet it too (see 3).
+
+
+3. LINUX BOOT - was dying 1.6 s after entry with zero output
+------------------------------------------------------------
+Root cause: u-boot arms a watchdog the kernel never fed; e17_wdt probes far too
+late. Fixed by petting early: head.S at entry (moveb #0,0xfec50000 as the 2nd
+instruction), config_eltec_e17(), the 100 Hz tick, and around console writes.
+After that e17_wdt takes over (hw 1600 ms, hard-IRQ pet every 400 ms). Linux now
+boots to userspace: SMP up, both CPUs online, /init runs.
+
+
+4. LINUX UART (goal 2) - root-caused, fixed, NOT yet verified on hw
+------------------------------------------------------------------
+ a. poll=1 and txirq=1 both default on, and were inconsistent: poll mode gives
+    RX a private IACK window (RPILR=CD2401_RX_IPL) and the rx timer acks there,
+    but the interrupt-mode putchar reprograms ALL THREE PILRs to the shared
+    0xfb. The first printk after startup thus clobbers RPILR, every later rx ack
+    matches no PILR, and receive dies. Fixed: e17_cd2401_tx_one() honours poll.
+ b. telnetd spawns /sbin/getty per session, but getty was never in the
+    initramfs -> every telnet connection accepted then instantly died with no
+    shell. With serial RX also broken (a) that left NO way into the board.
+    Fixed: getty added at /sbin/getty; init respawns telnetd.
+
+
+5. LOCKUP POST-MORTEM - overturns the documented theory
+-------------------------------------------------------
+The NVRAM breadcrumb dump was gated on PA7==0, but RMON's own watchdog petting
+clears the PA7 front-panel indication before Linux looks, so on a netbooted
+board it reads 1 and the entire post-mortem was silently discarded. Ungated it
+(the breadcrumb has its own validity magic; PA7 still decides WDIOF_CARDRESET).
+
+First real dump, from a genuine hang after ~128 s of uptime:
+
+  CPU0 hb=234, CPU1 hb=166 (snap 101); CPU1 ticked 65 more
+    -> CPU0-only stall (IRQs-off/level-6), bus alive
+    last region 0x00 (none/idle)
+  CPU0 last-tick PC 0x0000a9d0 (arch_cpu_idle+0x4/0x6); irq_err_count=0, badvec=0
+  CPU1 last-tick PC 0x0000a9d0 (arch_cpu_idle+0x4/0x6)
+
+This is NOT a whole-bus hang (README section "known hang problem" assumes one):
+CPU1 ticked 65 times after CPU0 died, so the bus was alive throughout. CPU0
+alone went into stop #0x2000 (arch_cpu_idle) and was never resumed - and its own
+tick is level-7 (non-maskable) and auto-clears on IACK, so a stopped tick means
+CPU0 itself is wedged in the stop state, not a maskable-interrupt problem. The
+CD2401 IACK path is NOT implicated (region=none, irq_err_count=0, no bad vector).
+
+Secondary observation (running degraded build): rcu_sched kthread starved,
+"Possible timer handling issue on cpu=1", telnetd state:R running - i.e. CPU1
+softirq/timer starvation. Consistent with the getty bug churning telnetd; the
+getty + telnetd-respawn fixes should clear it. Both symptoms are interrupt/timer
+DELIVERY problems, not bus problems.
+
+Candidate fix under test: e17_idle boot arg (halt|spin). Code default stays
+halt; the E17 netboot bootargs opt into e17_idle=spin, which uses the existing
+non-halting poll-baseline idle (drains IPIs, bounded register-only spin, then
+returns to the idle loop). It cannot get permanently stuck, so if the hang
+disappears the mechanism is confirmed as stop-instruction wakeup loss; if it
+persists it is VIC/bus routing. Either way the next boot is decisive.
+
+Also added: panic_on_rcu_stall=1 panic=10 in bootargs, so a half-working board
+(timers limping, watchdog still fed, unreachable) reboots instead of stranding.
+
+
+ARTIFACTS PUSHED (file2mqtt m68k/e17/files)
+-------------------------------------------
+ u-boot.e17boot                crc de108315  (bootdelay=-1, watchdog, RX fix,
+                                               bootargs incl. e17_idle=spin)
+ vmlinux.e17.stripped.lz4       crc 86fa50d4  (-B4; wdt pet; breadcrumb ungated;
+                                               poll RX fix; getty; e17_idle arg)
+
+Patches (repo): patches/e17-uboot-uart-watchdog.patch (u-boot side, excludes the
+maintainer's WIP in dummy.c / e17.h).
+
+
+OPEN / NEXT (needs a board reset - board is stuck in the OLD build, pingable but
+no login, will not self-reset because it still pets its own watchdog)
+--------------------------------------------------------------------------------
+ - Boot the pushed kernel; confirm serial RX and telnet (getty).
+ - Confirm e17_idle=spin removes the CPU0 idle stall; if so, decide whether to
+   make it the code default or find the underlying stop-wakeup cause.
+ - README "known hang problem" section needs rewriting: it is a CPU0-only idle
+   stall with the bus alive, not a whole-bus CD2401/LIRQ6 hang.
+ - MAC still reads 04:00:04:00:04:00 (RMON reads 00:00:5B:00:49:62 correctly);
+   the station-address PROM nibble decode is wrong. This is maintainer WIP.
+
+
+==========================================================================================
+RESOLUTION (same session, after board reset by the user)
+==========================================================================================
+
+With the board reset available again, all fixes were verified on hardware:
+
+GOAL 1 (u-boot UART): stable and verified (version, 60-char paste, rapid cmds).
+
+GOAL 2 (Linux UART):
+ - Serial console OUTPUT: rock-solid (always was).
+ - Telnet input path: FIXED and verified. Root cause of the earlier silent
+   telnet was getty: telnetd execs /sbin/getty per session, but getty was not
+   in the initramfs AND getty's mkdir /run/seat-* failed (no /run). Added getty
+   at /sbin/getty and created /run,/tmp,/etc. Telnet now gives a full shell
+   (uname -a etc.), and init respawns telnetd if it dies.
+ - Serial console INPUT: the poll/txirq (PILR-window) fix made single commands
+   work, but under sustained/concurrent load the CD2401 receive path drives CPU0
+   into a double-fault halt (CPU0-only stall, bus alive, level-7 tick stops;
+   region none; independent of HW_IPI y/n). This is the documented board-level
+   CD2401 hazard. Contained by defaulting the console to OUTPUT-ONLY
+   (serial_e17_cd2401.console_rx=0): the concurrent serial+telnet stress that
+   reliably wedged every prior build now PASSES (board steady at 3-5 ms ping,
+   no reset). console_rx=1 re-enables input for light use. Robust RX under load
+   remains open; telnet is the input path.
+
+GOAL 3 (lockups / watchdog reboots):
+ - Spontaneous idle stall FIXED by e17_idle=spin: old build hung at ~128 s idle;
+   fixed build ran 9+ min under load, both ticks ~100 Hz, ERR=0. Confirmed the
+   breadcrumb signature is CPU0-only (bus alive), not whole-bus.
+ - Watchdog self-recovery verified repeatedly (board returns to u-boot prompt
+   unattended). panic_on_rcu_stall=1 set from init (boot-arg form is rejected)
+   + panic=10 covers the half-wedged "pings but unreachable" state.
+ - Residual: a whole-bus cross-call hang during reboot (CPU0 in
+   smp_call_function_many_cond; CPU2CON doorbell write to the other CPU).
+
+Convenience: u-boot default bootfile now e17/vmlinux.e17.stripped.lz4, so a bare
+"run netboot" boots the kernel under test (env has no writable store yet; the
+user offered spare NVRAM for env - deferred pending a safe NVRAM-size probe,
+only ~240 B look free at 0x610-0x6ff on the 2 KB part).
+
+Final artifacts pushed (file2mqtt m68k/e17/files):
+ u-boot.e17boot            crc 23ddef96
+ vmlinux.e17.stripped.lz4  crc 5c756abf   (HW_IPI=y, console_rx off by default,
+                                           e17_idle=spin via bootargs, wdt pet,
+                                           breadcrumb ungated, getty+/run, init
+                                           sets panic_on_rcu_stall)

@@ -9,7 +9,10 @@
 # transfer short; bootelf parses the decompressed ELF.
 . "$(dirname "$0")/lib.sh"
 
+# build-linux.sh leaves a breadcrumb: the kernel may have been built in the
+# source tree rather than in build/linux (see the note there).
 LINUX_OUT="$BUILD/linux"
+[ -f "$BUILD/.linux-out" ] && LINUX_OUT="$(cat "$BUILD/.linux-out")"
 UBOOT_OUT="$BUILD/u-boot"
 mkdir -p "$TFTP"
 
@@ -28,7 +31,11 @@ if [ -f "$LINUX_OUT/vmlinux" ]; then
 	cp "$LINUX_OUT/vmlinux" "$BUILD/vmlinux.e17"
 	"${CROSS}strip" -o "$BUILD/vmlinux.e17.stripped" "$LINUX_OUT/vmlinux"
 	if have lz4; then
-		lz4 -9 -f "$BUILD/vmlinux.e17.stripped" \
+		# -B4 (64 KB blocks) rather than the 4 MB default: u-boot's lz4
+		# wrapper pets the watchdog once per frame block, so a
+		# single-block image decompresses for seconds with nothing
+		# petting and the board resets mid-boot.  Costs ~6% in size.
+		lz4 -9 -f -B4 "$BUILD/vmlinux.e17.stripped" \
 			"$BUILD/vmlinux.e17.stripped.lz4" >/dev/null
 	else
 		warn "no lz4 on PATH - U-Boot's default netboot expects the .lz4"

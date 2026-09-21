@@ -74,6 +74,7 @@ def main():
     seen = b""
     stage = "waiting for u-boot"
     last_poke = 0.0
+    pokes = 0
     deadline = time.time() + a.wait
     print(f"[{stage}]")
 
@@ -88,11 +89,15 @@ def main():
             continue
 
         if stage == "waiting for u-boot":
-            # Spam a harmless key through the autoboot countdown; at 9600 baud
-            # the three-second window is too short to react to precisely.
-            if AUTOBOOT in seen and time.time() - last_poke > 0.2:
+            # Tap a harmless key during the autoboot countdown - and only
+            # then.  Bytes sent *before* u-boot's serial driver has probed
+            # are what used to hang it (see patches/e17-cd2401-quiesce.patch),
+            # so nothing goes out until the countdown has announced itself,
+            # and only a few taps rather than a continuous stream.
+            if AUTOBOOT in seen and pokes < 6 and time.time() - last_poke > 0.4:
                 m.publish(tx, b" ")
                 last_poke = time.time()
+                pokes += 1
             if PROMPT in seen:
                 print(f"\n[u-boot prompt reached; bootfile={a.bootfile}]")
                 time.sleep(0.5)

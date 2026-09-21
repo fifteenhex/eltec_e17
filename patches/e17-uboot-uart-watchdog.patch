@@ -1,0 +1,842 @@
+diff --git a/arch/m68k/Kconfig b/arch/m68k/Kconfig
+index a8cc69c8faf..fcadf08d135 100644
+--- a/arch/m68k/Kconfig
++++ b/arch/m68k/Kconfig
+@@ -309,6 +309,13 @@ config TARGET_E17
+ 	select WDT
+ 	select WDT_MMIO
+ 
++	# Arm the board watchdog from cpu_init_f, long before the driver model
++	# is up, and let schedule() pet it.  The fragile code - the CD2401
++	# interrupt-acknowledge handshake - runs during early init, and a
++	# mis-stepped acknowledge there stalls the bus with no way back except
++	# a reset, so the safety net has to be in place before then.
++	select HW_WATCHDOG
++
+ 	# For populating the DT with the bootinfo data
+ 	select OF_BOARD_FIXUP
+ 	select SPL
+
+diff --git a/common/board_r.c b/common/board_r.c
+index 58eb6900546..80450e6f72c 100644
+--- a/common/board_r.c
++++ b/common/board_r.c
+@@ -606,6 +606,14 @@ static void initcall_run_r(void)
+ 	 */
+ 	INITCALL(initr_trace);
+ 	INITCALL(initr_reloc);
++	/*
++	 * Feed the watchdog through the whole of early board_r.  The first
++	 * WATCHDOG_RESET() below sits after initr_dm, board_init,
++	 * initr_dm_devices and serial_initialize - on a slow board that whole
++	 * device-probing stretch can outlast a short hardware period, and a
++	 * healthy board then resets before it ever prints "Now running in RAM".
++	 */
++	WATCHDOG_RESET();
+ 	INITCALL(event_init);
+ 	/* TODO: could x86/PPC have this also perhaps? */
+ #if CONFIG_IS_ENABLED(ARM) || CONFIG_IS_ENABLED(RISCV)
+@@ -631,14 +639,17 @@ static void initcall_run_r(void)
+ #if CONFIG_IS_ENABLED(SYS_HAS_NONCACHED_MEMORY)
+ 	INITCALL(noncached_init);
+ #endif
++	WATCHDOG_RESET();
+ 	INITCALL(initr_of_live);
+ #if CONFIG_IS_ENABLED(DM)
++	WATCHDOG_RESET();
+ 	INITCALL(initr_dm);
+ #endif
+ #if CONFIG_IS_ENABLED(ADDR_MAP)
+ 	INITCALL(init_addr_map);
+ #endif
+ #if CONFIG_IS_ENABLED(BOARD_INIT)
++	WATCHDOG_RESET();
+ 	INITCALL(board_init);	/* Setup chipselects */
+ #endif
+ 	/*
+@@ -660,8 +671,10 @@ static void initcall_run_r(void)
+ #if CONFIG_IS_ENABLED(FSP_VERSION2)
+ 	INITCALL(arch_fsp_init_r);
+ #endif
++	WATCHDOG_RESET();
+ 	INITCALL(initr_dm_devices);
+ 	INITCALL(stdio_init_tables);
++	WATCHDOG_RESET();
+ 	INITCALL(serial_initialize);
+ 	INITCALL(initr_announce);
+ 	INITCALL(dm_announce);
+
+diff --git a/drivers/serial/serial_cd2401.c b/drivers/serial/serial_cd2401.c
+index 2fa07394b1f..3594980601a 100644
+--- a/drivers/serial/serial_cd2401.c
++++ b/drivers/serial/serial_cd2401.c
+@@ -2,8 +2,6 @@
+ /*
+  */
+ 
+-#define DEBUG 1
+-
+ #include <clk.h>
+ #include <debug_uart.h>
+ #include <dm.h>
+@@ -13,6 +11,7 @@
+ #include <serial.h>
+ #include <linux/delay.h>
+ #include <time.h>
++#include <watchdog.h>
+ 
+ #include <cd2401.h>
+ #include <vic068a.h>
+@@ -109,97 +108,91 @@ static inline void serial_cd2401_disable_irqs(struct serial_cd2401_priv *priv)
+ 	serial_cd2401_write_reg(priv, CD2401_IER, 0);
+ }
+ 
+-static bool serial_cd2401_irq_line_asserted(const struct serial_cd2401_priv *priv)
+-{
+-	/*
+-	 * IRQ is active low, if the irq state is high CD2401
+-	 * isn't waiting yet.
+-	 */
+-	if	(vic_lirq_state((void *) E17_VIC, VIC_LICR6))
+-		return false;
+-
+-	return true;
+-}
+-
+-#define CD2401_IRQ_ASSERT_LOOPS (1 << 16)
++/*
++ * How long to wait for the chip to assert, in polls of the VIC.  Matched to
++ * the Linux driver's CD2401_STATE_POLL: long enough that a chip about to
++ * respond always does, short enough that sixteen failed rounds inside one
++ * putc() stay well clear of the watchdog period.
++ */
++#define CD2401_IRQ_ASSERT_LOOPS 20000
++#define CD2401_CCR_WAIT_LOOPS	20000
+ 
+ #define cd2401_ack_timeout for (unsigned int i = CD2401_IRQ_ASSERT_LOOPS; i > 0; cd2401_irq_delay(), i--)
+ 
+-static int serial_cd2401_ack_irq(struct serial_cd2401_priv *priv,
+-								 unsigned int ipl,
+-								 u8 *vector)
+-{
+-	u8 v = 0xff;
+-
+-	cd2401_ack_timeout {
+-		if (!serial_cd2401_irq_line_asserted(priv))
+-			continue;
+-
+-		/* Interrupt ack */
+-		v = readb(E17_SERIAL_IACK + ipl);
+-		if (vector)
+-			*vector = v;
+-
+-		return 0;
+-	};
++/* How many services to sit through before giving up on our own turn. */
++#define CD2401_SVC_RETRIES	16
+ 
+-	return -ETIMEDOUT;
+-}
+-
+-static int serial_cd2401_ack_tx_irq(struct serial_cd2401_priv *priv)
++static void serial_cd2401_collect_rx(struct serial_cd2401_priv *priv)
+ {
+-	u8 vector = 0;
+-
+-	cd2401_ack_timeout {
+-		int ret = serial_cd2401_ack_irq(priv, CD2401_TX_IPL, &vector);
+-		if (ret)
+-			return ret;
+-
+-		/*
+-		 * This is not the interrupt you are looking for.
+-		 * (Historically we did not return -EIO here.)
+-		 */
++	u8 buf[CD2401_FIFO_SZ];
++	unsigned int got = 0, i;
+ 
+-		if (!(serial_cd2401_read_reg(priv, CD2401_TIR) & CD2401_TIR_TACT))
+-			continue;
++	cd2401_finish_rx(priv->base, buf, sizeof(buf), &got);
+ 
+-		/* Not for this port */
+-		if (cd2401_interrupting_port(priv->base) != 0) {
+-			serial_cd2401_write_reg(priv, CD2401_TEOIR, CD2401_TEOIR_NOTRANS);
+-			continue;
+-		}
+-
+-		return 0;
+-	}
+-
+-	return -ETIMEDOUT;
++	for (i = 0; i < got; i++)
++		serial_cd2401_local_rx_fifo_push(priv, buf[i]);
+ }
+ 
++/*
++ * Transmit, by hand, through the chip's software acknowledge window.
++ *
++ * The CD2401 only moves data from inside a service context, so the sequence is
++ * "post a transmit request, wait for the chip to assert, acknowledge, write".
++ * Posting the request first is the invariant that makes the acknowledge safe:
++ * an acknowledge with nothing outstanding gets no DTACK and hangs the bus.
++ *
++ * What the acknowledge returns, though, is not ours to choose.  All three
++ * priority levels are equal, so the chip's internal priority decides, and
++ * receive outranks transmit - echoing a typed line means there is very often a
++ * character waiting.  So dispatch on the type that comes back: take the
++ * receive data if that is what we are handed (it would keep winning otherwise)
++ * and go round again, our transmit request still posted.
++ */
+ static int serial_cd2401_write_tx(struct udevice *dev, const u8* data, unsigned int len)
+ {
+ 	struct serial_cd2401_priv *priv = dev_get_priv(dev);
+-	unsigned int cnt;
+-	int written, ret;
++	void *vic = (void *)E17_VIC;
++	unsigned int cnt, n;
++	int sent = 0;
++	u8 ier;
+ 
+ 	serial_cd2401_select_chan(priv, 0);
+-	serial_cd2401_enable_tx_irqs(priv);
+-	ret = serial_cd2401_ack_tx_irq(priv);
+-	if (ret)
+-		goto out;
+-
+-	cnt = serial_cd2401_read_reg(priv, CD2401_TFTC);
+-
+-	for (int written = 0; (written < cnt) && (written < len); written++)
+-		writeb(*(data + written), priv->base + CD2401_TDR);
+-
+-	writeb(0, priv->base + CD2401_TEOIR);
+-	serial_cd2401_ack_tx_irq(priv);
+-	writeb(CD2401_TEOIR_NOTRANS, priv->base + CD2401_TEOIR);
++	cd2401_set_shared_pilr(priv->base);
++
++	ier = serial_cd2401_read_reg(priv, CD2401_IER);
++	serial_cd2401_write_reg(priv, CD2401_IER, ier | CD2401_IER_TXD);
++
++	for (int try = 0; try < CD2401_SVC_RETRIES && !sent; try++) {
++		u8 ack;
++
++		hw_watchdog_reset();	/* not via schedule(): re-entrancy */
++		if (!cd2401_wait_asserting(vic, CD2401_IRQ_ASSERT_LOOPS))
++			break;
++
++		ack = readb((void *)E17_SERIAL_IACK + CD2401_SVC_IPL);
++
++		switch (ack & CD2401_VECTOR_TYPE_MASK) {
++		case CD2401_VECTOR_TYPE_TXD:
++			cnt = serial_cd2401_read_reg(priv, CD2401_TFTC);
++			for (n = 0; n < cnt && n < len; n++)
++				writeb(data[n], priv->base + CD2401_TDR);
++			writeb(0, priv->base + CD2401_TEOIR);
++			sent = n;
++			break;
++		case CD2401_VECTOR_TYPE_RXD:
++		case CD2401_VECTOR_TYPE_RXEXCP:
++			serial_cd2401_collect_rx(priv);
++			break;
++		default:
++			writeb(CD2401_MEOIR_NOTRANS, priv->base + CD2401_MEOIR);
++			break;
++		}
++	}
+ 
+-out:
+-	serial_cd2401_disable_tx_irqs(priv);
++	/* Withdraw our transmit request. */
++	serial_cd2401_write_reg(priv, CD2401_IER, ier);
+ 
+-	return ret;
++	return sent ? 0 : -ETIMEDOUT;
+ }
+ 
+ static int serial_cd2401_putc(struct udevice *dev, const unsigned char ch)
+@@ -207,97 +200,53 @@ static int serial_cd2401_putc(struct udevice *dev, const unsigned char ch)
+ 	return serial_cd2401_write_tx(dev, &ch, 1);
+ }
+ 
+-static int serial_cd2401_ack_rx_irq(struct serial_cd2401_priv *priv)
+-{
+-	u8 vector = 0;
+-
+-	cd2401_ack_timeout {
+-		int ret = serial_cd2401_ack_irq(priv, CD2401_RX_IPL, &vector);
+-		if (ret)
+-			return ret;
+-
+-		/*
+-		 * This is not the interrupt you are looking for.
+-		 * (Historically we did not return -EIO here.)
+-		 */
+-
+-		if (!(serial_cd2401_read_reg(priv, CD2401_RIR) & CD2401_RIR_RACT)) {
+-			continue;
+-		}
+-		/* Not for this port */
+-		if (cd2401_interrupting_port(priv->base) != 0) {
+-			serial_cd2401_write_reg(priv, CD2401_REOIR, CD2401_REOIR_NOTRANS);
+-			continue;
+-		}
+-
+-		return 0;
+-	}
+-
+-	return -ETIMEDOUT;
+-}
+-
+-static int serial_cd2401_drain_rx(struct serial_cd2401_priv *priv)
++/*
++ * Collect whatever the chip has, without waiting.  getc() is polled, so
++ * "nothing typed yet" is an ordinary answer and must be a cheap one - the
++ * acknowledge only happens when the line says the chip is actually asserting.
++ */
++static void serial_cd2401_drain_rx(struct serial_cd2401_priv *priv)
+ {
+-	unsigned int cnt;
+-	int ret;
++	void *vic = (void *)E17_VIC;
++	u8 ack;
+ 
+-	/* Get the CD2401 into the rx interrupt state */
+ 	serial_cd2401_select_chan(priv, 0);
+-	serial_cd2401_enable_rx_irqs(priv);
+-	ret = serial_cd2401_ack_rx_irq(priv);
+-	if (ret)
+-		return ret;
+-
+-	/*
+-	 * Read (and thereby clear) the receive status.  A fast paste
+-	 * overruns the 16-byte FIFO, which the chip reports as a receive
+-	 * *exception* rather than a normal receive-data interrupt.  That
+-	 * special condition latches until RISR is read; if we skip it the
+-	 * chip re-asserts the interrupt forever and the console livelocks.
+-	 * Reading it is harmless for an ordinary receive-data interrupt.
+-	 */
+-	(void)serial_cd2401_read_reg(priv, CD2401_RISRH);
+-	(void)serial_cd2401_read_reg(priv, CD2401_RISRL);
+-
+-	/* Completely empty the fifo */
+-	cnt = serial_cd2401_read_reg(priv, CD2401_RFOC);
+-	for (int i = 0; i < cnt; i++) {
+-		u8 ch = serial_cd2401_read_reg(priv, CD2401_RDR);
+-		serial_cd2401_local_rx_fifo_push(priv, ch);
++	cd2401_set_shared_pilr(priv->base);
++
++	if (cd2401_asserting(vic)) {
++		ack = readb((void *)E17_SERIAL_IACK + CD2401_SVC_IPL);
++
++		switch (ack & CD2401_VECTOR_TYPE_MASK) {
++		case CD2401_VECTOR_TYPE_RXD:
++		case CD2401_VECTOR_TYPE_RXEXCP:
++			serial_cd2401_collect_rx(priv);
++			break;
++		case CD2401_VECTOR_TYPE_TXD:
++			/* Not our doing - we post transmit only inside putc. */
++			writeb(CD2401_TEOIR_NOTRANS, priv->base + CD2401_TEOIR);
++			break;
++		default:
++			writeb(CD2401_MEOIR_NOTRANS, priv->base + CD2401_MEOIR);
++			break;
++		}
+ 	}
+-
+-	/* Finish the interrupt */
+-	serial_cd2401_write_reg(priv, CD2401_REOIR, 0);
+-
+-	return ret;
+ }
+ 
+ static int serial_cd2401_getc(struct udevice *dev)
+ {
+ 	struct serial_cd2401_priv *priv = dev_get_priv(dev);
+-	int ret = 0;
+ 
+ 	if (serial_cd2401_local_rx_fifo_empty(priv))
+-		ret = serial_cd2401_drain_rx(priv);
+-	if (ret)
+-		return ret;
++		serial_cd2401_drain_rx(priv);
+ 
+ 	if (!serial_cd2401_local_rx_fifo_empty(priv))
+ 		return serial_cd2401_local_rx_fifo_pop(priv);
+ 
+ 	return -EAGAIN;
+ }
+-#if 0
+-/* todo use the vic signal ? */
+-/* No pending RX int? */
+-if (!(readb(priv->base + CD2401_RIR) & CD2401_RIR_REN))
+-	ret = 0;
+-#endif
+-
+ static int serial_cd2401_pending(struct udevice *dev, bool input)
+ {
+ 	struct serial_cd2401_priv *priv = dev_get_priv(dev);
+-	int ret = 1;
+ 
+ 	/*
+ 	 * Output is polled and drains immediately, so there is never any
+@@ -308,23 +257,19 @@ static int serial_cd2401_pending(struct udevice *dev, bool input)
+ 	if (!input)
+ 		return 0;
+ 
+-	if (input) {
+-		/* Have preloaded data */
+-		if (!serial_cd2401_local_rx_fifo_empty(priv))
+-			return 1;
++	/* Have preloaded data */
++	if (!serial_cd2401_local_rx_fifo_empty(priv))
++		return 1;
+ 
+-		/*
+-		 * There doesn't seem to be a good way to check how much
+-		 * incoming data there is without going into the interrupt
+-		 * handler path so we leave the RX int on and check if it's
+-		 * asserted.
+-		 */
+-		serial_cd2401_select_chan(priv, 0);
+-		if (!serial_cd2401_irq_line_asserted(priv))
+-			ret = 0;
+-	}
++	/*
++	 * There is no register that simply says "a character is waiting" - the
++	 * data only becomes reachable from inside a receive service context.
++	 * So the question "is anything pending" can only be answered by going
++	 * and collecting it, which drain_rx() does without blocking.
++	 */
++	serial_cd2401_drain_rx(priv);
+ 
+-	return ret;
++	return !serial_cd2401_local_rx_fifo_empty(priv);
+ }
+ 
+ #ifdef CONFIG_DEBUG_CD2401_SERIAL
+@@ -358,8 +303,26 @@ static int serial_cd2401_probe(struct udevice *dev)
+ 	priv->rx_head = 0;
+ 	priv->rx_tail = 0;
+ 
++	/*
++	 * cpu_init_f() already did this at takeover, but a character can have
++	 * arrived since - between there and here u-boot prints its banner,
++	 * sizes DRAM and relocates, which is plenty of time at 9600 baud.  An
++	 * unacknowledged service request would wedge the CCR poll below.
++	 */
++	cd2401_quiesce(priv->base, (void *)E17_SERIAL_IACK, (void *)E17_VIC);
++
++	/*
++	 * u-boot runs with interrupts masked at the CPU (cpu_init_f sets IPL7)
++	 * and drives this chip entirely by polling, so nothing should ever
++	 * vector on LIRQ6.  Mask it at the VIC once and leave it masked -
++	 * LICR.STATE is the raw pin and stays readable, which is all the
++	 * polling needs.  (Masking and unmasking around each character, as the
++	 * Linux polled path does, is a known wedge source.)
++	 */
++	vic_lirq_mask((void *)E17_VIC, VIC_LICR6);
++
+ 	/* clean up other channels */
+-	for (int i = 1; i < 3; i++) {
++	for (int i = 1; i < CD2401_NR_CHANNELS; i++) {
+ 		serial_cd2401_select_chan(priv, i);
+ 		serial_cd2401_disable_irqs(priv);
+ 		writeb(i << 2, priv->base + CD2401_LIV);
+@@ -377,17 +340,32 @@ static int serial_cd2401_probe(struct udevice *dev)
+ 	writeb(0, priv->base + CD2401_LIV);
+ 
+ 	/*
+-	 * Set the tx and rx ipls to different values so we
+-	 * can ack them individually.
++	 * One level for all three services.  Acknowledging transmit and
++	 * receive at *different* levels is what used to hang the bus: with a
++	 * character waiting the chip favours receive, so an acknowledge at the
++	 * transmit level matched nothing and was never answered.  See the
++	 * commentary on CD2401_SVC_PILR.
+ 	 */
+-	writeb(CD2401_TX_IPL, priv->base + CD2401_TPILR);
+-	writeb(CD2401_RX_IPL, priv->base + CD2401_RPILR);
++	cd2401_set_shared_pilr(priv->base);
+ 
+ 	/*
+-	 * Wait for any in-progress command to complete,
+-	 * not that there should be a command running...
++	 * Wait for any in-progress command to complete, but do not wait
++	 * forever: if the chip is somehow still holding a service request
++	 * this never clears, and an unbounded spin here is a silent hang
++	 * with no console to report it.  Carrying on gives the rest of
++	 * probe - and the error path - a chance to say something.
+ 	 */
+-	while(serial_cd2401_read_reg(priv, CD2401_CCR) != 0) {
++	for (int i = CD2401_CCR_WAIT_LOOPS; i; i--) {
++		if (serial_cd2401_read_reg(priv, CD2401_CCR) == 0)
++			break;
++		/*
++		 * Pet directly rather than via schedule(): this runs inside
++		 * the console driver, and schedule() can re-enter it.
++		 */
++		hw_watchdog_reset();
++		cd2401_irq_delay();
++		if (i == 1)
++			printf("cd2401: CCR still busy, continuing anyway\n");
+ 	}
+ 
+ 	writeb(CD2401_CCR_ENBRX | CD2401_CCR_ENBXMTR,
+
+diff --git a/include/cd2401.h b/include/cd2401.h
+index dde1688c7f3..4490a03b51e 100644
+--- a/include/cd2401.h
++++ b/include/cd2401.h
+@@ -19,22 +19,56 @@
+ #define CD2401_REOIR_NOTRANS BIT(3)
+ #define CD2401_TEOIR		0x85
+ #define CD2401_TEOIR_NOTRANS BIT(3)
++#define CD2401_MEOIR		0x86
++#define CD2401_MEOIR_NOTRANS BIT(3)
+ #define CD2401_RISRH		0x88
+ #define CD2401_RISRL		0x89
+ #define CD2401_TISR			0x8a
+ #define CD2401_TISR_TXEMPTY BIT(1)
+ #define CD2401_TPILR		0xe0
+ #define CD2401_RPILR		0xe1
++#define CD2401_MPILR		0xe3
+ #define CD2401_TIR			0xec
+ #define CD2401_TIR_TACT		BIT(6)
+ #define CD2401_RIR			0xed
+ #define CD2401_RIR_RACT		BIT(6)
+ #define CD2401_RIR_REN		BIT(7)
++#define CD2401_MIR			0xef
++#define CD2401_MIR_MACT		BIT(6)
++#define CD2401_MIR_MEN		BIT(7)
+ #define CD2401_CAR			0xee
+ #define CD2401_TDR			0xf8
+ #define CD2401_RDR			CD2401_TDR
+ 
+ #define CD2401_FIFO_SZ		16
++#define CD2401_NR_CHANNELS	4
++
++/*
++ * Shared service window.
++ *
++ * The chip answers a software interrupt acknowledge only when one of its three
++ * priority registers matches the level carried in the acknowledge address, and
++ * only for the request its own internal priority (rx > tx > modem) currently
++ * favours.  Giving transmit and receive *different* levels therefore looks
++ * reasonable and is a trap: with a character waiting, receive wins, so an
++ * acknowledge at the transmit level matches nothing and goes un-DTACKed - and
++ * this board has no bus-error timeout, so the 68040 stalls mid-cycle holding
++ * the bus and takes the second CPU with it.  That is the "type a word at the
++ * prompt and the board dies" failure.
++ *
++ * So all three levels are programmed alike (0xfb, as RMON and Linux both use;
++ * the compare is 7 bits, hence acknowledge address 0x7b) and callers dispatch
++ * on the vector type they get back rather than the one they wanted.
++ *
++ * Note there is deliberately no "is a request pending" test here.  RIR/TIR/MIR
++ * bit 6 reports an already-active service context, but no bit of theirs is a
++ * usable pending flag - TIR has none at all - so the only sound precondition
++ * for an acknowledge is the interrupt line itself, via LICR6.STATE.
++ */
++#define CD2401_SVC_PILR		0xfb
++#define CD2401_SVC_IPL		(CD2401_SVC_PILR & 0x7f)
++
++#define CD2401_IR_ACTIVE	BIT(6)
+ 
+ #define CD2401_VECTOR_TYPE_MASK		0x3
+ #define CD2401_VECTOR_TYPE_RXEXCP	0b00
+@@ -43,6 +77,8 @@
+ #define CD2401_VECTOR_TYPE_RXD		0b11
+ 
+ #ifndef __ASSEMBLY__
++#include <vic068a.h>
++
+ static inline unsigned int cd2401_interrupting_port(void *base)
+ {
+ 	return (readb(base + CD2401_LICR) >> 2) & 0x3;
+@@ -52,6 +88,116 @@ static inline unsigned int cd2401_vector_type(u8 vector)
+ {
+ 	return (vector & CD2401_VECTOR_TYPE_MASK);
+ }
++
++static inline void cd2401_set_shared_pilr(void *base)
++{
++	writeb(CD2401_SVC_PILR, base + CD2401_TPILR);
++	writeb(CD2401_SVC_PILR, base + CD2401_RPILR);
++	writeb(CD2401_SVC_PILR, base + CD2401_MPILR);
++}
++
++/*
++ * Is the chip asserting its interrupt?  LICR.STATE is the raw pin and active
++ * low.  This is the only safe precondition for an acknowledge - but it is not
++ * a perfect one: LIRQ6 is the self-vectored daisy chain shared with the system
++ * and user CIOs, so it can be low for something that is not this UART.  The
++ * chip answering is what keeps the cycle alive, so keep the two CIOs quiet.
++ */
++static inline int cd2401_asserting(void *vic)
++{
++	return !vic_lirq_state(vic, VIC_LICR6);
++}
++
++static inline int cd2401_wait_asserting(void *vic, unsigned int loops)
++{
++	while (loops--) {
++		if (cd2401_asserting(vic))
++			return 1;
++	}
++
++	return 0;
++}
++
++/*
++ * Finish a receive service: read the status, empty the fifo, end the
++ * interrupt.  The status read is not optional - a fifo overrun arrives as a
++ * receive *exception* which latches until RISR is read, and an unread
++ * exception re-asserts the interrupt for ever.
++ */
++static inline void cd2401_finish_rx(void *base, u8 *buf, unsigned int max,
++				    unsigned int *len)
++{
++	unsigned int n, i;
++
++	(void)readb(base + CD2401_RISRH);
++	(void)readb(base + CD2401_RISRL);
++
++	n = readb(base + CD2401_RFOC);
++	if (n > CD2401_FIFO_SZ)
++		n = CD2401_FIFO_SZ;
++
++	for (i = 0; i < n; i++) {
++		u8 ch = readb(base + CD2401_RDR);
++
++		if (buf && len && *len < max)
++			buf[(*len)++] = ch;
++	}
++
++	writeb(0, base + CD2401_REOIR);
++}
++
++/*
++ * Put the chip back into its background context, whatever state the previous
++ * owner left it in, and silence every channel.
++ *
++ * This matters at takeover.  The monitor ROM drives this UART right up to the
++ * moment it hands over, with the receiver and its interrupts enabled, so a
++ * character arriving during the handover latches a service request that the
++ * new owner never acknowledges: the chip asserts its interrupt line and waits.
++ * While a request is outstanding it will not accept a channel command either,
++ * so the CCR poll in serial_cd2401_probe() spins forever - which is why
++ * pressing a key too early used to stop u-boot from ever coming up.
++ *
++ * Unwinding it has to be done in the chip's own terms, one service type at a
++ * time, because RDR may only be touched inside the receive context and a
++ * latched receive exception re-asserts the interrupt until RISR is read.  A
++ * few passes, since another character can land while we work.
++ */
++static inline void cd2401_quiesce(void *base, void *iack, void *vic)
++{
++	int pass, i;
++
++	cd2401_set_shared_pilr(base);
++
++	for (pass = 0; pass < 16; pass++) {
++		u8 ack;
++
++		if (!cd2401_asserting(vic))
++			break;
++
++		ack = readb(iack + CD2401_SVC_IPL);
++
++		switch (ack & CD2401_VECTOR_TYPE_MASK) {
++		case CD2401_VECTOR_TYPE_RXD:
++		case CD2401_VECTOR_TYPE_RXEXCP:
++			cd2401_finish_rx(base, NULL, 0, NULL);
++			break;
++		case CD2401_VECTOR_TYPE_TXD:
++			/* NOTRANS, so nothing is sent on the way out. */
++			writeb(CD2401_TEOIR_NOTRANS, base + CD2401_TEOIR);
++			break;
++		default:
++			writeb(CD2401_MEOIR_NOTRANS, base + CD2401_MEOIR);
++			break;
++		}
++	}
++
++	/* Nothing is in service now, so the per-channel banking is ours. */
++	for (i = 0; i < CD2401_NR_CHANNELS; i++) {
++		writeb(i, base + CD2401_CAR);
++		writeb(0, base + CD2401_IER);
++	}
++}
+ #endif
+ 
+ #endif
+
+diff --git a/include/watchdog.h b/include/watchdog.h
+index 0149b44d077..2d6c540935c 100644
+--- a/include/watchdog.h
++++ b/include/watchdog.h
+@@ -38,6 +38,12 @@ int init_func_watchdog_reset(void);
+ 
+ #if defined(CONFIG_HW_WATCHDOG) || defined(CONFIG_WATCHDOG)
+ 	void hw_watchdog_init(void);
++	/*
++	 * Pet the hardware directly.  Prefer schedule(), which calls this for
++	 * you - but code that schedule() can re-enter (the console driver, say)
++	 * has to come straight here.
++	 */
++	void hw_watchdog_reset(void);
+ #endif
+ 
+ #endif /* _WATCHDOG_H_ */
+
+diff --git a/board/eltec/e17/dummy.c b/board/eltec/e17/dummy.c
+index f1ecda53c66..5e0a6fe365d 100644
+--- a/board/eltec/e17/dummy.c
++++ b/board/eltec/e17/dummy.c
+@@ -10,6 +10,11 @@
+ #include <linux/string.h>
+ #include <asm/bootinfo.h>
+ #include <asm/processor.h>
++#include <asm/io.h>
++#include <env.h>
++#include <net.h>
++#include <watchdog.h>
++#include <asm/e17/e17.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -65,6 +70,60 @@ void cpu_init_f(void)
+ 		"cinva   %%bc\n\t"		/* invalidate both caches: drop RMON's stale lines */
+ 		"nop\n\t"
+ 		: : : "d0");
++
++	/*
++	 * Silence the UART the monitor was still driving, before anything
++	 * else can touch it.
++	 *
++	 * RMON owns the CD2401 right up to the handover, receiver and
++	 * interrupts enabled.  A character that lands in the gap latches a
++	 * service request nobody acknowledges, and the chip then refuses
++	 * channel commands - so the CCR poll in the serial driver's probe
++	 * never completes and u-boot never reaches a prompt.  That was the
++	 * old "type a key too early and it hangs".
++	 *
++	 * This is the first point where it can be done: the transparent
++	 * translations set up just above are what make the 0xfec00000 I/O
++	 * window reachable at all.
++	 */
++	cd2401_quiesce((void *)E17_SERIAL, (void *)E17_SERIAL_IACK,
++		       (void *)E17_VIC);
++
++	/*
++	 * Arm the watchdog, here at the earliest opportunity, so that from now
++	 * on a wedge recovers by itself.
++	 *
++	 * That matters most for exactly the code above and the serial probe
++	 * that follows: a mis-stepped interrupt acknowledge to the CD2401 gets
++	 * no DTACK, and with no bus-error timeout on this board the 68040
++	 * stalls mid-cycle holding the bus, taking the second CPU with it.
++	 * Nothing short of a reset comes back from that, and until now that
++	 * meant somebody walking over to the crate.
++	 */
++	hw_watchdog_init();
++}
++
++/*
++ * The board watchdog (HW manual 3.8) is a single write-triggered register.
++ * It is disabled until the first write, which arms it; every write after that
++ * pets it; if it goes unpetted for the jumper-selected period (J1401: 100 ms,
++ * or 1.6 s) it pulses reset.  Software cannot turn it off again - only a reset
++ * can - so arming it is a commitment to keep feeding it.
++ *
++ * schedule() calls this for us (CONFIG_HW_WATCHDOG), which covers u-boot's
++ * wait loops - the network stack, the command line, delays.  A path that
++ * neither prints nor calls schedule() for longer than the period will reset a
++ * perfectly healthy board, which is the risk to watch if the jumper turns out
++ * to be on 100 ms rather than 1.6 s.
++ */
++void hw_watchdog_reset(void)
++{
++	writeb(0, (void *)E17_WATCHDOG);
++}
++
++void hw_watchdog_init(void)
++{
++	hw_watchdog_reset();
+ }
+ 
+ int dram_init(void)
+diff --git a/include/configs/e17.h b/include/configs/e17.h
+index fd4836e61a7..6fd3c6b1c39 100644
+--- a/include/configs/e17.h
++++ b/include/configs/e17.h
+@@ -26,12 +26,66 @@
+  * setenv netboot 'dhcp ${loadaddr} ${bootfile}; setenv autostart yes;
+  * bootelf -p ${loadaddr}'; run netboot
+  */
++/*
++ * Console is serial (CD2401) only.  The onboard video driver is disabled for
++ * now: its DM_VIDEO cyclic full-frame dcache flush hangs the boot on real
++ * hardware (see CONFIG_VIDEO_E17, kept in-tree but off in the defconfig).
++ */
++/*
++ * initramfs is no longer baked into the kernel (CONFIG_INITRAMFS_SOURCE was
++ * dropped).  u-boot now TFTPs three files - the board device tree
++ * (${fdtfile} -> ${fdtaddr}), the initramfs cpio (${initrd_file} ->
++ * ${initrd_start}) and the lz4 kernel (${bootfile} -> ${loadaddr}) - then
++ * writes the initramfs location into the DTB's /chosen node
++ * (linux,initrd-start/-end) with "fdt chosen ${initrd_start} ${initrd_size}"
++ * and boots.  The bootinfo builder (arch/m68k/lib/bootinfo.c) advertises the
++ * loaded DTB via BI_FDT and the ramdisk via BI_RAMDISK (env initrd_start/
++ * initrd_size), so the kernel finds the ramdisk from the device tree.
++ *
++ * RAM map (32 MB board):
++ *   0x0000000-0x0700000  kernel image (bootelf copies LOAD segs to phys 0)
++ *   0x0800000-0x1000000  bootaddr: decompressed ELF, parsed by bootelf (temp)
++ *   0x1000000-0x1800000  loadaddr: compressed lz4 kernel (temp, <=8 MB)
++ *   0x1800000-0x1810000  fdtaddr:  board .dtb (patched in place by fdt resize)
++ *   0x1810000-....       initrd_start: initramfs cpio (grows toward u-boot)
++ * The kernel reserves the DTB and the initramfs so neither is clobbered.
++ * autoload=no keeps "dhcp" from auto-TFTPing the bootfile; we fetch each
++ * file explicitly.
++ */
++/*
++ * No autoboot by default: come up at the prompt and wait.
++ *
++ * Autoboot made every kernel test a race against a three-second countdown on
++ * a 9600-baud link, with the penalty for mistiming a keystroke being a wedged
++ * board and a trip to the power switch.  Landing at the prompt instead costs
++ * one "run netboot" and makes the board reliably drivable.  Put it back for
++ * unattended operation with "setenv bootdelay 2".
++ */
++/*
++ * panic_on_rcu_stall=1 panic=10 in bootargs: reboot a board that has gone
++ * degraded instead of letting it limp.  The hardware watchdog only rescues us
++ * when the tick dies outright; a machine whose timers are half-working keeps
++ * petting it forever while being useless - answering pings, no console input,
++ * no way back in, and no reset.  An RCU stall is the earliest reliable signal
++ * of that state, and rebooting on it restores unattended recovery.
++ */
+ #define CFG_EXTRA_ENV_SETTINGS \
++		"bootdelay=-1\0" \
++		"stdin=serial\0" \
++		"stdout=serial\0" \
++		"stderr=serial\0" \
+ 		"loadaddr=0x1000000\0" \
+ 		"bootaddr=0x800000\0" \
+ 		"dstsize=0x800000\0" \
++		"initrd_start=0x1810000\0" \
+ 		"serverip=192.168.2.1\0" \
+-		"bootfile=vmlinux.e17.stripped.lz4\0" \
+-		"bootargs=console=ttyS0 ip=dhcp\0" \
+-		"netboot=dhcp ${loadaddr} ${bootfile}; crc32 ${loadaddr} ${filesize}; unlz4 ${loadaddr} ${bootaddr} ${dstsize}; setenv autostart yes; bootelf -p ${bootaddr}\0" \
++		"autoload=no\0" \
++		"bootfile=e17/vmlinux.e17.stripped.lz4\0" \
++		"initrd_file=e17-rootfs.cpio\0" \
++		"bootargs=console=tty0 console=ttyS0 ip=dhcp panic_on_rcu_stall=1 panic=10 e17_idle=spin\0" \
++		"nfetch=dhcp; " \
++			"tftp ${loadaddr} ${bootfile}; crc32 ${loadaddr} ${filesize}\0" \
++		"nprep=unlz4 ${loadaddr} ${bootaddr} ${dstsize}\0" \
++		"netboot=run nfetch; run nprep; setenv autostart yes; " \
++			"bootelf -p ${bootaddr}\0" \
+ 		"bootcmd=run netboot\0"

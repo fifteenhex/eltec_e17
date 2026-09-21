@@ -460,39 +460,49 @@ the kernel linear-map alias; and m68k must *not* select
 `GENERIC_IRQ_MULTI_HANDLER`, because each CPU dispatches through its own 680x0
 vector table via its own VBR.
 
-### Open problem: intermittent whole-bus hangs
+### Lockups: what they actually were (updated 2026-09-21)
 
-The board still takes intermittent hard hangs under Linux — both CPUs frozen
-mid-bus-cycle, recovered only by the watchdog. A breadcrumb record in
-battery-backed NVRAM at `$FEC2.0600` survives the reset and records both CPUs'
-heartbeats, the interrupted PCs, `irq_err_count`, the last unexpected vector,
-and which suspect bus region CPU0 was in.
+Two *different* lockups were conflated under "intermittent whole-bus hang".
+Ungating the NVRAM breadcrumb (`$FEC2.0600`) from the front-panel PA7 check —
+RMON's own watchdog petting clears PA7 before Linux reads it, so on a netbooted
+board every post-mortem had been silently discarded — finally made both
+readable. See `logs/real-board/session-20260921-uart-watchdog.txt`.
 
-What has been ruled out so far: the ILACC (hangs continue with the interface
-down), and the self-vectored LIRQ6 IACK phantom (all three devices on that
-chain have been silenced — System CIO interrupts disabled, User CIO CT3
-disabled, CD2401 masked and fully polled — and the hangs persist,
-`irq_err_count` staying 0 throughout).
+**1. Spontaneous idle stall — FIXED.** The common spontaneous hang is *not* a
+whole-bus hang: the breadcrumb shows CPU0 stuck in `arch_cpu_idle` with the bus
+**alive** — CPU1 kept ticking dozens of times after CPU0's last tick,
+`irq_err_count` 0, no bad vector, region none. CPU0 halted on `stop #0x2000`
+and its own (non-maskable, level-7) tick stopped, i.e. the 68040 did not resume
+from `stop`. The fix is to not halt: boot arg `e17_idle=spin` uses the
+poll-baseline idle (drain IPIs, bounded register-only spin, return to the idle
+loop). Code default stays `halt`; the E17 netboot bootargs opt into `spin`.
+Verified on hardware: the old build hung at ~128 s of idle; with `e17_idle=spin`
+the board ran 9+ minutes under load with both ticks climbing at ~100 Hz.
 
-Observed directly on 2026-09-21 (`logs/real-board/session-20260921-linux.txt`):
-the board hung twice in one session while **completely idle** — no console
-input, nothing running — and netbooted itself each time. Both breadcrumbs show
-the same signature: `irq_err_count` 0, no bad vector, PHASE 0 (not inside any
-marked bus region), CPU1 having ticked zero times after CPU0's last tick. In
-one, CPU0 was in `smp_call_function_many_cond+0x278` (mid cross-CPU call) with
-CPU1 idle; in the other, CPU0 was idle and CPU1 was in
-`_raw_spin_unlock_irqrestore`. Measured at idle on that same build, the two
-ticks run at 98.5 Hz and 99.8 Hz — **1.013x, no storm** — so whatever provokes
-the over-tick is load-dependent and is not a precondition for the hang.
+**2. Serial-RX load hang — CONTAINED.** Under sustained serial *console input*
+the CD2401 receive path drives CPU0 into what looks like a double-fault halt
+(CPU0-only stall, bus alive, stops even the level-7 tick, region none — e.g.
+last-tick PC in `_raw_spin_unlock_irqrestore`). This is the old
+"serial is output-only in practice" hazard: the chip shares the self-vectored
+LIRQ6 chain and the board has no bus-error timeout. It reproduces reliably with
+concurrent serial + telnet load and is independent of IPI mode (`HW_IPI` y or n
+both hang) and of the idle fix. It is *not* on the normal path — telnet is the
+input path once Linux is up — so the console now defaults to **output-only**
+(`serial_e17_cd2401.console_rx=0`): transmit is solid, nothing on receive can
+wedge the machine, and the stress test that reliably killed every earlier build
+now passes. `console_rx=1` re-enables input for light interactive use, with the
+hazard understood. Making RX robust under load remains open.
 
-The surviving suspect is the secondary CPU's VIC-clock path. The VIC timer's
-LIRQ2 output is a level-wide square wave; delivered to the secondary through
-CPU2CON it reads level-like, so after the `SICF = 4` ack the still-asserted line
-re-latches and the secondary re-enters its tick many times per period — a
-measured ~2.4x over-tick that is present in every recorded crash, and which on
-its own is enough to starve RCU on that CPU. A leaky-bucket detector now
-disables the runaway tick from the secondary's own side. The next experiment is
-simply booting `maxcpus=1` to see whether the hangs stop.
+**Self-recovery.** U-Boot arms the board watchdog before handing over and the
+kernel pets it from head.S / the tick / `e17_wdt` (400 ms hard-IRQ pet), so a
+genuine hang resets the board unattended. `panic_on_rcu_stall=1` (set from init;
+the boot-arg form is rejected) plus `panic=10` covers the half-wedged case a
+watchdog cannot — one CPU dead but timers still petting — turning it into a
+clean reboot instead of a board that pings but cannot be reached.
+
+Still open: the whole-bus cross-call hang seen during `reboot` (CPU0 in
+`smp_call_function_many_cond`, the CPU2CON doorbell write to the other CPU) and
+robust serial RX under load.
 
 ## Sources
 
