@@ -818,7 +818,7 @@ index f1ecda53c66..aa911a0da88 100644
  	/* Set the machine */
 
 diff --git a/include/configs/e17.h b/include/configs/e17.h
-index fd4836e61a7..78642dc201f 100644
+index fd4836e61a7..2d4770320d3 100644
 --- a/include/configs/e17.h
 +++ b/include/configs/e17.h
 @@ -26,12 +26,66 @@
@@ -884,10 +884,34 @@ index fd4836e61a7..78642dc201f 100644
 +		"autoload=no\0" \
 +		"bootfile=e17/vmlinux.e17.stripped.lz4\0" \
 +		"initrd_file=e17-rootfs.cpio\0" \
-+		"bootargs=console=tty0 console=ttyS0 ip=dhcp e17_idle=spin panic=10 sysctl.kernel.panic_on_rcu_stall=1 e17_drm.frame_irq=1 e17_drm.vblank=1 -- smolinit.telnetd=23 smolinit.securetty=/dev/ttyS0\0" \
++		"bootargs=console=tty0 console=ttyS0 ip=dhcp e17_idle=spin panic=10 sysctl.kernel.panic_on_rcu_stall=1 -- smolinit.telnetd=23 smolinit.securetty=/dev/ttyS0\0" \
 +		"nfetch=dhcp; " \
 +			"tftp ${loadaddr} ${bootfile}; crc32 ${loadaddr} ${filesize}\0" \
 +		"nprep=unlz4 ${loadaddr} ${bootaddr} ${dstsize}\0" \
 +		"netboot=run nfetch; run nprep; setenv autostart yes; " \
 +			"bootelf -p ${bootaddr}\0" \
  		"bootcmd=run netboot\0"
+
+diff --git a/configs/eltec-e17_defconfig b/configs/eltec-e17_defconfig
+index 15a9472a78b..71bef435368 100644
+--- a/configs/eltec-e17_defconfig
++++ b/configs/eltec-e17_defconfig
+@@ -18,8 +18,9 @@ CONFIG_SYS_MONITOR_BASE=0x600000
+ # CONFIG_LEGACY_IMAGE_FORMAT is not set
+ CONFIG_LOG=y
+ CONFIG_SPL_LOG=y
+-CONFIG_CYCLIC_MAX_CPU_TIME_US=1000
++CONFIG_CYCLIC_MAX_CPU_TIME_US=100000
+ CONFIG_BOARD_EARLY_INIT_R=y
++CONFIG_BOARD_LATE_INIT=y
+ CONFIG_STACKPROTECTOR=y
+ CONFIG_SPL_MAX_SIZE=0x100000
+ CONFIG_SPL_PAD_TO=0x0
+@@ -76,3 +77,7 @@ CONFIG_SYS_ALT_MEMTEST=y
+ CONFIG_SYS_ALT_MEMTEST_BITFLIP=y
+ CONFIG_SYS_MEMTEST_START=0x00100000
+ CONFIG_SYS_MEMTEST_END=0x01c00000
++CONFIG_SYS_CBSIZE=256
++CONFIG_SYS_PBSIZE=1044
++CONFIG_VIDEO=y
++CONFIG_VIDEO_E17=y
