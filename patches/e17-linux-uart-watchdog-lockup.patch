@@ -287,7 +287,7 @@ index 6e7c3baadf27..13317dc47758 100644
  		if (is_valid_ether_addr(mac)) {
  			eth_hw_addr_set(dev, mac);
 diff --git a/drivers/tty/serial/serial_e17_cd2401.c b/drivers/tty/serial/serial_e17_cd2401.c
-index 07fa8ac13d12..786cf850d378 100644
+index 07fa8ac13d12..796b1a777c4b 100644
 --- a/drivers/tty/serial/serial_e17_cd2401.c
 +++ b/drivers/tty/serial/serial_e17_cd2401.c
 @@ -25,6 +25,7 @@
@@ -298,7 +298,15 @@ index 07fa8ac13d12..786cf850d378 100644
  #include <linux/init.h>
  #include <linux/interrupt.h>
  #include <linux/io.h>
-@@ -120,6 +121,29 @@ module_param(poll, bool, 0444);
+@@ -51,6 +52,7 @@
+ #define CD2401_CMR		0x1b	/* channel mode */
+ #define CD2401_CMR_ASYNC	0x02
+ #define CD2401_RFOC		0x30	/* receive FIFO output count */
++#define CD2401_FIFO_SZ		16	/* receive/transmit FIFO depth */
+ #define CD2401_TFTC		0x80	/* tx FIFO transfer count (free space) */
+ #define CD2401_REOIR		0x84	/* receive end of interrupt */
+ #define CD2401_TEOIR		0x85	/* transmit end of interrupt */
+@@ -120,6 +122,29 @@ module_param(poll, bool, 0444);
  MODULE_PARM_DESC(poll,
  	"Fully-polled, no CD2401 interrupts (default 1; 0 = interrupt-driven)");
  
@@ -328,7 +336,7 @@ index 07fa8ac13d12..786cf850d378 100644
  /* RX poll period.  Timer granularity is one jiffy (HZ=100 -> 10 ms). */
  #define E17_CD2401_POLL_JIFFIES	1
  /* Max RX service contexts drained per poll, so a fast sender can't hog the lock. */
-@@ -299,7 +323,21 @@ static bool e17_cd2401_tx_one_irq(struct e17_cd2401_port *up, u8 ch)
+@@ -299,7 +324,21 @@ static bool e17_cd2401_tx_one_irq(struct e17_cd2401_port *up, u8 ch)
  /* Returns true if the byte was handed to the chip, false if it did not respond. */
  static bool e17_cd2401_tx_one(struct e17_cd2401_port *up, u8 ch)
  {
@@ -351,7 +359,21 @@ index 07fa8ac13d12..786cf850d378 100644
  		return e17_cd2401_tx_one_irq(up, ch);
  	return e17_cd2401_tx_one_polled(up, ch);
  }
-@@ -598,8 +636,20 @@ static int e17_cd2401_startup(struct uart_port *port)
+@@ -361,6 +400,13 @@ static void e17_cd2401_rx_chars(struct uart_port *port)
+ 	cd_read(port, CD2401_RISRH);
+ 	cd_read(port, CD2401_RISRL);
+ 	cnt = cd_read(port, CD2401_RFOC);
++	/*
++	 * RFOC must never exceed the 16-byte FIFO.  If a racing/stale service
++	 * context returns a bogus count, an unclamped loop reads RDR far past
++	 * any valid data - reads that on this board can fault the bus.  Clamp.
++	 */
++	if (cnt > CD2401_FIFO_SZ)
++		cnt = CD2401_FIFO_SZ;
+ 	for (i = 0; i < cnt; i++) {
+ 		u8 ch = cd_read(port, CD2401_DR);
+ 
+@@ -598,8 +644,20 @@ static int e17_cd2401_startup(struct uart_port *port)
  		 */
  		cd_write(port, CD2401_RPILR, CD2401_RX_IPL);
  		cd_write(port, CD2401_TPILR, CD2401_TX_IPL);
@@ -374,7 +396,7 @@ index 07fa8ac13d12..786cf850d378 100644
  		up->tx_idle = true;
  		uart_port_unlock_irqrestore(port, flags);
  
-@@ -612,8 +662,12 @@ static int e17_cd2401_startup(struct uart_port *port)
+@@ -612,8 +670,12 @@ static int e17_cd2401_startup(struct uart_port *port)
  		licr = readb(up->vic + E17_VIC_LICR6);
  		writeb(licr | E17_VIC_LICR_MASK, up->vic + E17_VIC_LICR6);
  
@@ -389,7 +411,7 @@ index 07fa8ac13d12..786cf850d378 100644
  		return 0;
  	}
  
-@@ -706,7 +760,8 @@ static void e17_cd2401_shutdown(struct uart_port *port)
+@@ -706,7 +768,8 @@ static void e17_cd2401_shutdown(struct uart_port *port)
  	unsigned long flags;
  
  	if (poll) {
@@ -399,7 +421,7 @@ index 07fa8ac13d12..786cf850d378 100644
  		uart_port_lock_irqsave(port, &flags);
  		cd_write(port, CD2401_CAR, 0);
  		cd_write(port, CD2401_IER, 0);		/* stop posting RX */
-@@ -800,10 +855,19 @@ static void e17_cd2401_console_write(struct console *co, const char *s,
+@@ -800,10 +863,19 @@ static void e17_cd2401_console_write(struct console *co, const char *s,
  		return;
  	port = &up->port;
  

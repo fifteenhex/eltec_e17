@@ -224,3 +224,38 @@ CONFIG_TMPFS_XATTR=y).
 Still open: robust serial console RX under load (console_rx=0 by default); the
 whole-bus cross-call hang under heavy cross-call load (distinct from reboot,
 which is now fixed); MAC PROM decode (04:00:04:00:04:00); QEMU model.
+
+
+==========================================================================================
+ADDENDUM 2 - MAC fixed; serial-RX-under-load root-caused to an SMP CPU2CON race
+==========================================================================================
+
+MAC: fixed and verified.  The station address is six plain bytes in the NVRAM
+board-ID block at 0xfec20488 (00 00 5b 00 49 62), NOT the ILACC/LANCE window at
+0xfec69d81 (which just returns a constant 00 00 00 04 -> the bogus
+04:00:04:00:04:00).  Both readers (u-boot dummy.c, linux e17-lance.c) now read
+the NVRAM.  u-boot banner and Linux eth0 both show 00:00:5b:00:49:62; the
+correct MAC gets a stable DHCP lease (192.168.2.154).
+
+SERIAL RX ("uart totally fixed"): output console is rock-solid and never wedges;
+console_rx defaults off (telnet is the input path).  Turning console_rx=1 and
+driving heavy serial input + concurrent telnet load still wedges the board.
+Added a real fix along the way (clamp RFOC to the 16-byte FIFO in rx_chars, it
+was unbounded), but it does not eliminate the wedge.
+
+Root cause (breadcrumb): it is not a CD2401 bus fault (region=none, not in the
+IACK/RX regions).  CPU0's last-tick PC is arch_cpu_idle+0x30 - the BOUNDED,
+register-only spin-idle loop with IRQs enabled - yet its (non-maskable, level-7)
+tick then stops, and CPU1 hangs in smp_call_function_many_cond waiting for CPU0.
+A register-only spin cannot halt a CPU, so CPU0's tick/IRQ delivery itself was
+disrupted.  That points at the documented hazard: cross-CPU CPU2CON access is
+unsafe (SIPL/SICF overlap), and CPU1 acks its VIC clock through CPU2CON every
+tick while CPU0 also writes CPU2CON for IPI doorbells.  Under load these race
+and can knock out CPU0's VIC-clock / IRQ context.  Serial RX just raises the
+cross-call rate and exposes it; it is the same underlying bug as the "whole-bus
+cross-call hang", NOT a UART bug.
+
+Net: the UART is fixed for reliable use (stable output console + telnet input,
+console_rx=0).  Making serial RX robust under load requires serialising /
+redesigning cross-CPU CPU2CON access (VIC-clock ack + IPI doorbells) - a deeper
+SMP change with deadlock risk in the level-7 tick path, tracked separately.
