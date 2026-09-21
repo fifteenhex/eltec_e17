@@ -1,3 +1,6 @@
 /build/
 *.pyc
 __pycache__/
+/linux/
+/u-boot/
+/qemu/

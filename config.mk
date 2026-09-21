@@ -16,15 +16,15 @@
 
 # ---- where the sources come from -------------------------------------------
 
-QEMU_SRC   ?= /workspace/src/qemu-e17
+QEMU_SRC   ?= $(CURDIR)/qemu
 QEMU_GIT   ?= /workspace/git/qemu.git
 QEMU_REF   ?= e17-linux
 
-LINUX_SRC  ?= /workspace/src/linux-e17
+LINUX_SRC  ?= $(CURDIR)/linux
 LINUX_GIT  ?= /workspace/git/linux.git
 LINUX_REF  ?= e17-clean
 
-UBOOT_SRC  ?= /workspace/src/uboot-e17-fixes
+UBOOT_SRC  ?= $(CURDIR)/u-boot
 UBOOT_GIT  ?= /workspace/git/u-boot.git
 UBOOT_REF  ?= e17-fixes
 
