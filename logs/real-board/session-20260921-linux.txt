@@ -1,0 +1,116 @@
+Real-board Linux session, 2026-09-21
+Kernel on the board: 7.2.0-e17-gf6f414346d28-dirty #406 SMP Thu Aug 27 2026
+  (= e17-clean commit f6f414346d28, i.e. one commit BEFORE the current head -
+   none of the System-CIO disable / CD2401 polled-mode / VIC-tick-source /
+   storm-rework fixes are on the board yet.)
+
+Boot path, as observed
+----------------------
+RMON `boot` -> "Network bootstrap V1.3", TFTP of `u-boot.e17boot`
+(192.168.2.117 -> server 192.168.2.1, 188 KB, the mke17boot-wrapped U-Boot)
+-> U-Boot 2026.01-00681-g154bd7f80ad2-dirty relocates to 0x01fca000
+-> DHCP (192.168.2.221) -> TFTP `vmlinux.e17.stripped.lz4` (5016227 bytes,
+   crc32 86e5df78) -> unlz4 to 0x800000 (7795936 bytes) -> bootelf -> kernel.
+
+The DIP switches read 0x01, i.e. "use the saved NVRAM configuration"; there is
+no autostart nibble set, so the board sits at the RMON prompt until something
+types `boot`.
+
+SMP bring-up (dmesg)
+--------------------
+E17: power-on VIC SSCR0 = 0x12 (RMON's value, before enable)
+E17 SMP: snoop enabled for cpu0 -> SNCR=0x01
+E17 SMP: IPI backend up (mbox IRQ pri->sec, ICMS IRQ sec->pri)
+SMP: __cpu_up(1): releasing secondary via CPU2CON...
+SMP: AP pages @phys 0x00ce6000  vbr=0x00ce6000  entry=0x00ce6400 ...
+SMP: IPI #1 acked -- boot->AP mailbox doorbell works
+SMP: AP FPU probe: PRESENT (fnop executed cleanly)
+SMP: IPI #2 acked -- secondary sees its own VIC clock (tick works)
+SMP: IPI interrupt works -- AP took the level-6 mailbox IRQ
+SMP: VIC-clock interrupt works -- AP took the level-4 tick IRQ
+SMP: cross-CPU coherency OK -- 256 ping-pong rounds all matched
+E17 SMP: snoop enabled for cpu1 -> SNCR=0x05
+SMP: AP MMU OK -- secondary translated a kernel vaddr correctly
+SMP: AP secondary_start_kernel: progress 6/6
+SMP: CPU1 came online
+smp: Brought up 1 node, 2 CPUs
+
+Both CPUs are real 68040s with FPUs, 31.8 MHz, 21.24 BogoMips each.
+
+Tick rates at idle: NOT storming
+--------------------------------
+After 182.50 s of uptime:
+
+            CPU0       CPU1
+   4:          0      18220  auto            vicclock-cpu1
+   6:          0        379  auto            ipi-mailbox
+   8:        200          0  user        8   ipi-icms
+  10:      17979          0  user       10   vicclock-cpu0
+ 205:        342          0  VIC068A     7   eth0
+ 206:          0          0  VIC068A     1   e17-kbd
+ ERR:          0
+
+  CPU0 17979 / 182.5 s =  98.5 Hz
+  CPU1 18220 / 182.5 s =  99.8 Hz   -> 1.013x, i.e. no storm at idle.
+
+So on this build the AP VIC-clock over-tick does not happen while the machine
+is idle; whatever provokes it is load-dependent.  ERR stays 0.
+
+Two watchdog resets seen, with breadcrumbs
+------------------------------------------
+First boot of the session decoded the previous hang as:
+
+  watchdog reset: breadcrumb CPU0 hb=117, CPU1 hb=173 (snap 173);
+  CPU1 ticked 0 more -> whole-bus hang (both CPUs froze);
+  last region 0x00 (none/idle)
+    CPU0 last-tick PC 0x0000aa0c (arch_cpu_idle+0x4/0x6);
+      irq_err_count(lo)=0, last bad vector=0
+    CPU1 last-tick PC 0x0048c166 (_raw_spin_unlock_irqrestore+0x12/0x14)
+
+The board then hung AGAIN during this session (unattended, no console input,
+nothing running but the idle system and a stalled telnetd) and re-netbooted
+itself.  That boot decoded:
+
+  watchdog reset: breadcrumb CPU0 hb=160, CPU1 hb=123 (snap 123);
+  CPU1 ticked 0 more -> whole-bus hang (both CPUs froze);
+  last region 0x00 (none/idle)
+    CPU0 last-tick PC 0x000848c0 (smp_call_function_many_cond+0x278/0x28c);
+      irq_err_count(lo)=0, last bad vector=0
+    CPU1 last-tick PC 0x0000aa0c (arch_cpu_idle+0x4/0x6)
+
+Same signature as the crashes reported earlier: irq_err_count 0, no bad
+vector, PHASE 0 (not inside any of the marked suspect bus regions), and CPU0
+sitting in smp_call_function_many_cond - i.e. mid cross-CPU call - while CPU1
+is idle.  Both froze in the same instant.
+
+Note the raw breadcrumb read from RMON before this boot
+(db fec20600 10 -> e1 51 25 25 00 00 00 aa 0c 00 00 00 00 aa 0c 79, i.e.
+magic e1, hb0=81, hb1=37, phase 0, both PCs 0x0000aa0c) does NOT match either
+decode above, so there was at least one more boot/hang cycle in between than
+I directly observed.
+
+Bug found: the ethernet MAC is wrong
+------------------------------------
+U-Boot:  "E17: station address 04:00:04:00:04:00 (from board PROM)"
+Linux:   "e17-lance ... eth0: E17 ILACC at 0xfec68000, IRQ 205,
+          MAC 04:00:04:00:04:00"
+
+The board's real address is 00:00:5B:00:49:62 (ELTEC OUI), which RMON prints
+in its banner and which is stored in the NVRAM board-ID block at
+0xfec2048a.  Both U-Boot's and Linux's reads of the station-address PROM
+around LANCE +0x1d01/+0x1d81 are producing 04:00:04:00:04:00 - a nibble/lane
+extraction that is wrong, not a missing PROM.  DHCP still works (the server
+hands out 192.168.2.221 regardless), but the board is lying about its
+identity on the wire.
+
+Console notes
+-------------
+The serial console is OUTPUT ONLY on this build: nothing typed at it reaches
+the shell (CR, LF and CRLF all ignored; RMON, by contrast, echoes fine, so the
+link and the bridge are good).  That is the CD2401 receive path, which is
+exactly what the polled-mode work on e17-clean addresses.
+`/init` therefore starts BusyBox telnetd, and scripts/e17sh.py is the way in.
+
+telnetd blocks until "random: crng init done", which on this machine took
+several minutes after boot - a connection refused/timing out right after boot
+is that, not a dead network.

@@ -141,6 +141,36 @@ RMON can load it over the serial console:
 XON/XOFF, so upload through something that honours software flow control — a
 raw blast overruns it and drops records, which then F-lines in `gm`.
 
+### Talking to the board from here
+
+The board's serial console is bridged to MQTT by smolmqtt's `serial2mqtt`:
+
+    serial2mqtt -b 9600 -c 8N1 /dev/ttyUSB1 <broker> m68k/e17
+
+which publishes what the board says to `m68k/e17/rx` and writes what you
+publish to `m68k/e17/tx` out of the port. `scripts/e17con.py` is a
+dependency-free MQTT client wrapped around that:
+
+    make console SECS=60                       # watch the console
+    make console-cmd CMD='db fec20600 10'      # one RMON command + its reply
+    python3 scripts/e17con.py expect 'e17 =>' 120
+
+Broker and topic default to `$E17_BROKER` (192.168.3.2) and `$E17_TOPIC`
+(`m68k/e17`).
+
+**Once Linux is up, the serial console is output-only** — nothing typed at it
+reaches the shell, because the CD2401 receive path is the very thing under
+investigation. `/init` therefore starts BusyBox telnetd, and
+`scripts/e17sh.py` is the way in:
+
+    make shell CMD='cat /proc/interrupts'
+    python3 scripts/e17sh.py -f commands.txt
+
+`telnetd` blocks until the kernel's CRNG is seeded, which on a 68040 with no
+entropy source takes several minutes after boot. A connection that times out
+right after boot is that, not a dead network — wait for
+`random: crng init done` on the serial console.
+
 ### Probing the hardware
 
 `tools/e17probe.py` is a **read-only** RMON probe: it issues only display

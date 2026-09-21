@@ -123,10 +123,14 @@ Registers are byte-wide on **byte lane 3** of 32-bit words: VIC register *n*
 lives at byte offset `n*4+3`. So LICR1..LICR7 (regs 9..15) are at
 `0x27,0x2b,0x2f,0x33,0x37,0x3b,0x3f`, LIVBR (reg 21) at `0x57`, ICMSICR at
 `0x47`, ICMSIVBR at `0x53`, ICFSR at `0x5f`, SSCR0 at `0xc3`.
-On the real board this is a live register file (`[HW]`: regs 0-7 read
-`0xf8..0xff`, reg 10 `0x37`) — a model that returns zeros is wrong.
-NVRAM bytes `0x00-0x1f` hold the (value, offset) pairs RMON replays into the
-VIC at boot.
+On the real board this is a live register file — a model that returns zeros is
+wrong. NVRAM bytes `0x00-0x1f` hold the (value, offset) pairs RMON replays into
+the VIC at boot, and comparing those against the live registers shows RMON
+post-processes some of them (see below).
+A full dump as RMON leaves it is in
+`logs/real-board/session-20260921-registers.txt`; the load-bearing values
+`[HW]`: `LIVBR = 0x40`, `LICR2 = 0x37`, every other `LICRn = 0x88` (masked),
+`SSCR0 = 0xd2`.
 
 **User CIO — `$FEC1.0000`**, **System CIO — `$FEC3.0000`** (Z8536) `[MAN]`+`[RE]`
 Standard hookup: `+3` control (indexed, pointer/data flip-flop), `+2` port A,
@@ -148,7 +152,12 @@ Byte-wide battery-backed SRAM with the clock in the last 8 bytes of the device
 (`$FEC2.07F8` on a 2 KB part, mirrored at `$FEC2.7FF8`):
 `ctl, sec, min, hour, dow, date, month, year`, all BCD; control bit `0x40` =
 READ latch, `0x80` = WRITE latch. `[HW]` confirmed: `00 38 40 12 03 21 07 26`
-= 2026-07-21 12:40:38.
+= 2026-07-21 12:40:38. The year register counts from 1970 (Linux's `m48t59`
+driver agrees with the raw BCD read).
+
+> `[HW]` On our board the clock runs ten days slow (it read 2026-09-11 on
+> 2026-09-21) while the NVRAM contents are perfectly intact, so the battery is
+> fine and the oscillator is losing time — probably while powered down.
 
 Contents layout:
 
@@ -174,7 +183,9 @@ must be written every 100 ms (min 70, max 140) or 1.6 s ±30% — jumper selecte
 A watchdog reset lights the left decimal point of the front-panel hex display
 and is readable as System CIO PA7 = 0; writing `$FEC5.0000` clears the
 indicator, as do power-up, the reset switch, VMEbus SYSRESET and a VIC remote
-reset.
+reset. In practice PA7 is only useful very early: RMON pets the watchdog, which
+clears the indicator, so by the time you can read it from the monitor prompt it
+says nothing `[HW]`. The kernel latches the answer at boot instead.
 
 > A watchdog reset drives **VMEbus SYSRESET** — it resets *every board in the
 > crate*, not just this one.
@@ -207,6 +218,11 @@ RAP written at `+6`, RDP accessed at `+2`, both word-size. Am79C900: 32-bit
 initialisation block and descriptors (a plain 16-bit LANCE model will not do).
 Station address PROM nibbles live around `+0x1d01/+0x1d81` on odd byte lanes;
 the authoritative MAC is the one in the NVRAM board-ID block.
+
+> **Open bug** `[HW]`: both U-Boot and Linux currently read that PROM as
+> `04:00:04:00:04:00` instead of the board's real `00:00:5B:00:49:62` — the
+> nibble/lane extraction is wrong in both. RMON gets it right, and the address
+> is also sitting in NVRAM at `0xfec2048a`.
 
 **SCSI — `$FEC6.C000`** `[RE]`
 NCR 53C720, **byte lanes reversed within 32-bit words**: big-endian offset =
@@ -264,8 +280,15 @@ Key facts learned the hard way:
   LIRQ1 — that was wrong twice over.
 * **LICR bit 4 = autovector/VIC-vector enable.** Set, the VIC supplies the
   vector (`LIVBR | LIRQn`) *and* DTACK; clear, the line is self-vectored and the
-  device on it must answer the IACK itself. LIVBR (`0x57`) is normally `0x40`,
-  so VIC-vectored LIRQ*n* → vector `0x40+n`.
+  device on it must answer the IACK itself. LIVBR (`0x57`) is `0x40` `[HW]`, so
+  VIC-vectored LIRQ*n* → vector `0x40+n`. That value is not a ROM constant: it
+  comes from the VIC init table in NVRAM (`0x40 -> offset 0x57`).
+* **What RMON actually leaves running** `[HW]`: LICR2 = `0x37` — the VIC tick
+  timer enabled, VIC-vectored, at **CPU level 7** — and every other LICR masked
+  (`0x88`). SSCR0 reads `0xd2` although the NVRAM table stores `0x12`: RMON ORs
+  in the top two bits (enable + rate) at run time, so a 100 Hz IPL7 interrupt is
+  live before your code gets control. U-Boot turns it off in `cpu_init_r`, and
+  the kernel consequently sees the un-enabled `0x12`.
 * **The LIRQ6 daisy chain is a bus-hang hazard.** Three devices (CD2401,
   System CIO, User CIO) share one self-vectored input at level 5. If a device
   asserts the line and then withdraws the request before the level-5 IACK cycle
@@ -309,10 +332,11 @@ resets the secondary.
 
 **SNCR — `$FEC5.E000`, write-only** `[MAN]` Tables 52/53. Two bits per CPU
 (SC1/SC0): `01` = "supply dirty and sink", the coherent mode for shared
-write-through data. Because it is write-only, software must keep a shadow.
-Note `[HW]`: *reading* `$FEC5.E000` returns `0x40` — RMON also writes a CPU-type
-code (1 = 68040, 4 = 68060) to this address, so read and write sides differ and
-the earlier "CPU type register" label is at best half the story.
+write-through data. Because it is write-only, software must keep a shadow —
+and it really is write-only: reading it gave `0x40` in July 2026 and `0xff` in
+September `[HW]`, so the read side carries no information. (RMON also writes a
+CPU-type code, 1 = 68040 / 4 = 68060, to this address, which is where the old
+"CPU type register" label came from.)
 
 **Bringing up the secondary** `[RE]`, verified in QEMU and on hardware:
 
@@ -449,6 +473,17 @@ down), and the self-vectored LIRQ6 IACK phantom (all three devices on that
 chain have been silenced — System CIO interrupts disabled, User CIO CT3
 disabled, CD2401 masked and fully polled — and the hangs persist,
 `irq_err_count` staying 0 throughout).
+
+Observed directly on 2026-09-21 (`logs/real-board/session-20260921-linux.txt`):
+the board hung twice in one session while **completely idle** — no console
+input, nothing running — and netbooted itself each time. Both breadcrumbs show
+the same signature: `irq_err_count` 0, no bad vector, PHASE 0 (not inside any
+marked bus region), CPU1 having ticked zero times after CPU0's last tick. In
+one, CPU0 was in `smp_call_function_many_cond+0x278` (mid cross-CPU call) with
+CPU1 idle; in the other, CPU0 was idle and CPU1 was in
+`_raw_spin_unlock_irqrestore`. Measured at idle on that same build, the two
+ticks run at 98.5 Hz and 99.8 Hz — **1.013x, no storm** — so whatever provokes
+the over-tick is load-dependent and is not a precondition for the hang.
 
 The surviving suspect is the secondary CPU's VIC-clock path. The VIC timer's
 LIRQ2 output is a level-wide square wave; delivered to the secondary through

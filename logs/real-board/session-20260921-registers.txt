@@ -1,0 +1,134 @@
+Real-board session, 2026-09-21
+Board: EUROCOM-17, rev 1.M, serial 187562, dual 68040, 32 MB, no video fitted.
+Access: serial console bridged to MQTT by smolmqtt's serial2mqtt
+        (serial2mqtt -b 9600 -c 8N1 /dev/ttyUSB1 <broker> m68k/e17),
+        driven with scripts/e17con.py.  All RMON commands below are read-only.
+
+=============================================================================
+RMON banner
+=============================================================================
+               Version : 3.1.3 (27) for the Eurocom 17 - 68040
+         Creation date : 02apr97
+        Board Revision : 1.M
+         Serial Number : 187562
+         RAM available : 32 MBytes
+         Secondary CPU : Installed
+Extended slave address : 0x80000000  256 MByte
+          ICF1 address : 0x8000
+      Ethernet address : 00:00:5B:00:49:62
+
+=============================================================================
+VIC068A register file  --  dl fec01000 40
+=============================================================================
+fec01000 : 080808f8  080808f9  080808fa  080808fb
+fec01010 : 080808fc  080808fd  080808fe  080808ff
+fec01020 : 080808f8  08080888  08080837  08080888
+fec01030 : 08080888  08080888  08080888  08080888
+fec01040 : 080808f8  0808087f  080808f0  0808080f
+fec01050 : 0808081f  08080840  08080808  08080800
+fec01060 : 08080800  08080800  08080800  08080800
+fec01070 : 08080800  080808fc  0808087f  08080880
+fec01080 : 08080800  0808080f  0808080f  0808080f
+fec01090 : 0808080f  0808080f  0808080f  0808080f
+fec010a0 : 08080844  08080810  08080800  080808f0
+fec010b0 : 08080860  08080800  08080800  08080800
+fec010c0 : 080808d2  08080862  08080816  08080862
+fec010d0 : 08080800  08080800  08080800  08080800
+fec010e0 : 080808ff  08080800  080808ff  080808e8
+fec010f0 : 080808ff  080808ff  080808ff  080808ff
+
+VIC register n is the low byte of the long at fec01000 + n*4 (byte lane 3).
+Decoded, as RMON leaves it:
+
+    reg  0- 7  (+03..+1f)  f8 f9 fa fb fc fd fe ff   VME IRQ1-7 vector regs
+    reg  9     (+27) LICR1 = 88   keyboard      masked (bit7)
+    reg 10     (+2b) LICR2 = 37   VIC tick      ENABLED, VIC-vectored (bit4),
+                                                sense 0x30, CPU level 7
+    reg 11     (+2f) LICR3 = 88   SCSI          masked
+    reg 12     (+33) LICR4 = 88   video frame   masked
+    reg 13     (+37) LICR5 = 88   LEB           masked
+    reg 14     (+3b) LICR6 = 88   CD2401+CIOs   masked
+    reg 15     (+3f) LICR7 = 88   ILACC         masked
+    reg 17     (+47) ICMSICR  = 7f   ICMS0 masked (bit4), group IPL 7
+    reg 20     (+53) ICMSIVBR = 1f
+    reg 21     (+57) LIVBR    = 40   <-- confirms vector = 0x40 | LIRQn
+    reg 23     (+5f) ICFSR    = 00   no interprocessor switch set
+    reg 40     (+a3) transfer time-out = 44
+    reg 48     (+c3) SSCR0    = d2   tick timer enabled, bits 7:6 = 11
+    reg 49/50/51 (+c7/+cb/+cf) = 62 16 62
+
+So out of RMON the ONLY unmasked local interrupt is the VIC's own tick timer,
+at CPU level 7, 100 Hz.  (U-Boot turns it off again in cpu_init_r.)
+
+=============================================================================
+IOC-2 chip-select / memory controller  --  dl fec70000 2c
+=============================================================================
+fec70000 : fec00000  00000f30  00000b84  00000b83
+fec70010 : 00000b84  00001bc3  00000b81  00000b81
+fec70020 : 00000b84  00000b82  00001b82  00000f30
+fec70030 : 00000f30  00000830  00000b80  fec00b80
+fec70040 : fe800000  fff00000  00000a03  fff00a03
+fec70050 : fea00000  fff00000  00000a04  fff00a04
+fec70060 : 00000b82  00000b82  fff00a04  fff00a04
+fec70070 : fff00a04  fff00a04  fff00a04  fff00a04
+fec70080 : fff00a04  fff00a04  00000b82  00000b82
+fec70090 : 00000b82  00000b82  00000b82  00000b82
+fec700a0 : 00000000  f0000000  0000528b  00000000
+
+reg 0x00 = fec00000 (own base), 0xa4 = f0000000, 0xa8 = 0000528b.
+ROM bank fe800000/fff00000/0a03 and SRAM bank fea00000/fff00000/0a04 confirm
+the modelled map.
+
+=============================================================================
+System CIO ports  --  db fec30000 4
+=============================================================================
+fec30000 : ff 01 89 94
+    +0 port C  = ff
+    +1 port B  = 01   DIP switches: low nibble 1 = "load the saved NVRAM
+                      configuration" (not a ROM profile, no autostart)
+    +2 port A  = 89   PA7 = 1 -> watchdog indicator NOT lit *at this moment*.
+                      Note this proves little: RMON pets the watchdog, and any
+                      write to $FEC5.0000 clears the indicator.  The kernel's
+                      breadcrumb is the reliable "was it a watchdog reset".
+    +3 control = 94   (MCCR).  Do not make a habit of reading +3: the control
+                      port is the indexed pointer/data port and reading it
+                      toggles the pointer flip-flop.
+
+=============================================================================
+Write-only registers, read back  --  db fec5e000 4 / db fec5c000 4
+=============================================================================
+fec5e000 : ff ff ff ff      SNCR (snoop control).  Read 0x40 in the July 2026
+                            probe, 0xff now -> reads are NOT meaningful.  The
+                            manual says write-only; keep a software shadow.
+fec5c000 : 80 ff e7 ff      ESR (enable slave select).  +0 = 80, as in July.
+
+=============================================================================
+NVRAM: the VIC init table RMON replays  --  db fec20000 20
+=============================================================================
+fec20000 : 00 ab f0 af 60 b3 40 57 10 a7 46 a3 00 b7 12 c3
+fec20010 : 82 c7 16 cb 82 cf 00 d3 00 d7 00 db 00 df 80 7f
+
+(value, VIC byte-offset) pairs:
+    00->ab  f0->af  60->b3  40->57  10->a7  46->a3  00->b7  12->c3
+    82->c7  16->cb  82->cf  00->d3  00->d7  00->db  00->df  80->7f
+
+Two things this settles:
+  * LIVBR (+57) is *configured* to 0x40 from NVRAM - it is not a ROM constant.
+  * SSCR0 (+c3) is stored as 0x12 but reads back 0xd2, i.e. RMON ORs in the
+    top two bits (tick enable + rate) at run time.  The kernel sees 0x12 at
+    power-on and prints "E17: power-on VIC SSCR0 = 0x12 (RMON's value, before
+    enable)" - consistent, because U-Boot clears the enable first.
+  * +a3 reads 0x44 live but is 0x46 in the table, and +c7/+cf read 0x62 but
+    are 0x82 in the table: the RE'd "special-casing of 0xc7/0xcf from
+    fec700a8 bits 3-4" is real (a8 = 0x528b -> those bits = 01).
+
+=============================================================================
+Battery-backed RTC  --  db fec207f8 8
+=============================================================================
+fec207f8 : 08 37 02 00 05 11 09 56
+    ctl=08 sec=37 min=02 hour=00 dow=05 date=11 month=09 year=56 (all BCD)
+    -> 2026-09-11 00:02:37, and the kernel agrees ("setting system clock to
+       2026-09-11T00:06:51 UTC"), so the year register is years-since-1970.
+    The real date was 2026-09-21: the clock is TEN DAYS SLOW.  Since the NVRAM
+    contents are intact the battery still holds data; the oscillator appears
+    to lose time (or stop) while the board is powered down.  Worth a look.

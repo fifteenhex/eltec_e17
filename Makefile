@@ -22,7 +22,7 @@ S := $(CURDIR)/scripts
 
 .PHONY: help all deps toolchain sources qemu linux uboot rootfs boot-images \
         run-rmon run-uboot run-linux run-smptest probe-qemu probe-board \
-        tftp nvram clean distclean
+        tftp nvram console console-cmd shell clean distclean
 
 help:
 	@sed -n '2,9p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
@@ -46,6 +46,10 @@ help:
 	@echo "  probe-board   run it against a real board (PORT=/dev/ttyUSB0)"
 	@echo "  tftp          serve $(TFTP) for netbooting the real board"
 	@echo "  nvram         create a blank 2 KB M48T02 image"
+	@echo ""
+	@echo "  console       watch the real board's serial console (SECS=30)"
+	@echo "  console-cmd   send one RMON command      CMD='db fec20600 10'"
+	@echo "  shell         run a command on the booted board over telnet"
 	@echo ""
 	@echo "  clean         remove build outputs (keeps fetched sources)"
 	@echo "  distclean     remove $(BUILD) entirely"
@@ -93,6 +97,21 @@ probe-board:
 
 tftp:
 	$(S)/tftp-serve.sh
+
+# --- driving the real board ---------------------------------------------
+# console: the serial console, bridged to MQTT by serial2mqtt.
+# shell:   BusyBox telnetd, which is how you get input in (the serial console
+#          is output-only on the current kernel).
+console:
+	python3 $(S)/e17con.py listen $(or $(SECS),30)
+
+console-cmd:
+	@test -n "$(CMD)" || { echo 'usage: make console-cmd CMD="db fec20600 10"'; exit 2; }
+	python3 $(S)/e17con.py cmd $(CMD)
+
+shell:
+	@test -n "$(CMD)" || { echo 'usage: make shell CMD="cat /proc/interrupts"'; exit 2; }
+	python3 $(S)/e17sh.py $(CMD)
 
 clean:
 	rm -rf $(BUILD)/qemu $(BUILD)/linux $(BUILD)/u-boot $(BUILD)/rootfs \
