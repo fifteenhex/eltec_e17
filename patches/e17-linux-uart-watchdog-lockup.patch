@@ -811,6 +811,28 @@ index 26641312e09e..a7b57f62d6a9 100644
  
  /* PHASE codes (0 = not in any marked region). */
  #define E17_BC_PH_NONE		0x00
+diff --git a/kernel/rcu/tree_stall.h b/kernel/rcu/tree_stall.h
+index cf7ae51cba40..3416efa1a8b9 100644
+--- a/kernel/rcu/tree_stall.h
++++ b/kernel/rcu/tree_stall.h
+@@ -17,7 +17,16 @@
+ // Controlling CPU stall warnings, including delay calculation.
+ 
+ /* panic() on RCU Stall sysctl. */
+-static int sysctl_panic_on_rcu_stall __read_mostly;
++/*
++ * E17: default ON.  This dual-68040 board can hit an SMP RCU stall (a CPU that
++ * stops answering, incl. during boot) that the hardware watchdog cannot catch -
++ * the surviving CPU keeps petting it.  The sysctl.kernel.* command-line form is
++ * applied too late to cover a boot-time stall, and init runs too late too, so
++ * default it here: an RCU stall then panics -> panic=10 -> e17_reset (which
++ * parks the secondary and lets the watchdog reset the board), turning an
++ * otherwise-silent boot hang into a self-healing reboot.
++ */
++static int sysctl_panic_on_rcu_stall __read_mostly = 1;
+ static int sysctl_max_rcu_stall_to_panic __read_mostly;
+ 
+ static const struct ctl_table rcu_stall_sysctl_table[] = {
 diff --git a/include/linux/e17_wdt.h b/include/linux/e17_wdt.h
 new file mode 100644
 index 000000000000..8ed3dd300e65
