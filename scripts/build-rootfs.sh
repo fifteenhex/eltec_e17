@@ -2,14 +2,13 @@
 # Build the initramfs the kernel boots.
 #
 # Contents:
-#   /init            PID 1.  ROOTFS_INIT=nolibc (default) builds rootfs/init.c
-#                    against the kernel's own nolibc - a few KB instead of
-#                    ~550 KB of static glibc, which matters because a fat
-#                    vmlinux collides with U-Boot's bootelf load on the real
-#                    board.  ROOTFS_INIT=busybox uses rootfs/init.sh instead.
+#   /init            PID 1: smolutils' init (master), which also provides
+#                    reboot/poweroff/halt and starts getty/telnetd from the
+#                    smolinit.* kernel command line (see configs/e17.h).
+#   /sbin, /bin      smolutils userland (busybox-style multicall binaries),
+#                    built static for -m68040 from the smolutils tree.
 #   /init-smptest    the SMP/hotplug stress harness (boot with
 #                    rdinit=/init-smptest)
-#   /bin/busybox     static BusyBox, if the toolchain can link a libc
 #   /dev/console etc static device nodes
 #
 # The device nodes have to be baked in: the kernel needs to open /dev/console
@@ -50,7 +49,7 @@ if [ ! -x "$GEN" ]; then
 	cc -O2 -o "$GEN" "$LINUX/usr/gen_init_cpio.c"
 fi
 
-# ---- nolibc userspace -------------------------------------------------------
+# ---- nolibc helper (for the standalone SMP stress harness) ------------------
 
 nolibc_cc() {  # nolibc_cc <out> <src>
 	"${CROSS}gcc" -Os -static -nostdlib -nostdinc \
@@ -65,93 +64,86 @@ nolibc_cc() {  # nolibc_cc <out> <src>
 say "building init-smptest (nolibc)"
 nolibc_cc "$ROOT/init-smptest" "$TOP/tests/smpstress.c"
 
-case "${ROOTFS_INIT:-nolibc}" in
-nolibc)
-	say "building /init (nolibc)"
-	nolibc_cc "$ROOT/init" "$TOP/rootfs/init.c"
-	install -m 0755 "$TOP/rootfs/init.sh" "$ROOT/init.real"
-	;;
-busybox)
-	say "using the BusyBox shell script as /init"
-	install -m 0755 "$TOP/rootfs/init.sh" "$ROOT/init"
-	;;
-*)
-	die "ROOTFS_INIT must be 'nolibc' or 'busybox'"
-	;;
-esac
-
-# ---- smolutils --------------------------------------------------------------
+# ---- smolutils (master) -----------------------------------------------------
 #
-# The userspace is smolutils rather than BusyBox: it is built against the same
-# nolibc (plus nolibc-extensions for the sockets nolibc lacks), so it needs no
-# target libc at all, and it is small enough not to bloat the netboot image.
-# telnetd matters most - with Linux up, the CD2401 console is output-only, so
-# it is the only way to drive the board.
+# The userspace is smolutils, built from its own tree with Makefile.m68kmmu
+# (CPU=68040, NOPIE=1 -> plain -static, no dynamic loader).  Master is a
+# busybox-style set of multicall binaries plus a real init/getty/telnetd with
+# an auth mechanism:
+#
+#   * init  is PID 1 and also provides reboot/poweroff/halt (dispatched on
+#     argv[0]); it reads smolinit.* args from the kernel command line to know
+#     which gettys and telnetd to start (see the bootargs in configs/e17.h).
+#   * a "securetty" (set to the serial console) is where auth codes are shown.
+#     A telnet login and `su` each print a random code there and ask for it
+#     back - and since the E17 serial console is output-only under Linux
+#     (console_rx defaults off, see the CD2401 driver), that code appears on
+#     serial2mqtt where we can read it.  This is the supported way to root.
+#   * getty drops the login to an unprivileged uid; `su` regains root from a
+#     file capability (cap_setuid,cap_setgid) that startup applies at boot -
+#     no setuid bit.  This needs CONFIG_TMPFS_XATTR so the rootfs can hold it.
+#
+# There is deliberately no serial getty: the console is output-only, so a
+# getty there could never read a login.  Input is via telnet.
 
-# getty is not optional: telnetd spawns /sbin/getty for every session, so
-# without it a telnet connection is accepted and then silently dies with no
-# shell - which, when the serial console is output-only, means no way into the
-# board at all.
-SMOL_PROGS="${SMOL_PROGS:-smolsh telnetd getty cat ls ps dmesg uname df mount kill touch tftp}"
+SMOL_MK="${SMOL_MK:-Makefile.m68kmmu}"
+SMOL_CPU="${SMOL_CPU:-68040}"
+TARWAK="${TARWAK:-/workspace/src/tarwak/build/tarwak}"
 
-if [ -d "$SMOLUTILS" ] && [ -d "$NLEXT/include" ]; then
-	say "building smolutils userspace ($SMOL_PROGS)"
-	for p in $SMOL_PROGS; do
-		[ -f "$SMOLUTILS/$p.c" ] || { warn "no $p.c in $SMOLUTILS"; continue; }
-		"${CROSS}gcc" -include "$LINUX/tools/include/nolibc/nolibc.h" \
-			-include "$NLEXT/include/nolibc-extensions.h" \
-			-Wl,--hash-style=gnu \
-			-Werror=return-type -Werror=implicit-function-declaration \
-			-nostdlib -std=c99 -Os -m68040 -static \
-			-I"$KINC" -I"$NLEXT/include" \
-			-o "$ROOT/bin/$p" "$SMOLUTILS/$p.c" -lgcc ||
-			die "failed to build smolutils/$p.c"
-		"${CROSS}strip" "$ROOT/bin/$p"
-	done
-	ln -sf smolsh "$ROOT/bin/sh"
-	# telnetd execs it by absolute path.
-	if [ -x "$ROOT/bin/getty" ]; then
-		mkdir -p "$ROOT/sbin"
-		mv "$ROOT/bin/getty" "$ROOT/sbin/getty"
-	fi
+# tarwak features that select the optional manifest entities (net tools,
+# telnetd, and the initramfs /init -> /sbin/init symlink).  Kept in step with
+# what we build below.
+SMOL_FEATURES="-fnet -ftelnetd -finitramfs -fmodules"
+
+if [ -d "$SMOLUTILS" ] && [ -d "$NLEXT/include" ] && [ -x "$TARWAK" ]; then
+	say "building smolutils ($SMOL_MK CPU=$SMOL_CPU)"
+	make -C "$SMOLUTILS" -f "$SMOL_MK" CPU="$SMOL_CPU" NOPIE=1 \
+		CROSS_COMPILE="$CROSS" \
+		NOLIBCDIR="$LINUX/tools/include/nolibc" \
+		NOLIBCEXTDIR="$NLEXT" \
+		UAPIDIR="$KINC" \
+		TARWAK="$TARWAK" \
+		-j "$JOBS" elfs >/dev/null || die "smolutils build failed"
+
+	# Let smolutils lay out its own rootfs from rootfs.tarwak.json: the proper
+	# /lib/smol multicall binaries, the /bin and /sbin symlink farm, the
+	# /init -> /sbin/init initramfs symlink, and the file-capability xattrs on
+	# su/ping/init (so su becomes root from a capability, not a setuid bit).
+	# tarwak writes a tar; bsdtar converts it to a newc cpio in the pack step
+	# below, carrying the capability xattrs straight into the initramfs image.
+	say "packing smolutils rootfs (tarwak)"
+	( cd "$SMOLUTILS" && "$TARWAK" -i rootfs.tarwak.json -o "$OUT/smol.tar" \
+		-b ./ -p "%s.$SMOL_CPU.elf" $SMOL_FEATURES ) ||
+		die "tarwak failed"
 else
-	warn "no smolutils at $SMOLUTILS (or nolibc-extensions at $NLEXT):
-  the image will have no shell and no telnetd, so the board cannot be driven."
-fi
-
-# ---- BusyBox (legacy, needs a libc) -----------------------------------------
-
-if [ "${ROOTFS_BUSYBOX:-0}" = 1 ] && cross_has_libc; then
-	BB="$BUILD/busybox/busybox-$BUSYBOX_VERSION"
-	if [ ! -x "$BB/busybox" ]; then
-		mkdir -p "$BUILD/busybox" "$BUILD/dl"
-		tarball="$BUILD/dl/busybox-$BUSYBOX_VERSION.tar.bz2"
-		[ -f "$tarball" ] || {
-			say "downloading BusyBox $BUSYBOX_VERSION"
-			curl -fL --progress-bar -o "$tarball" "$BUSYBOX_URL"
-		}
-		[ -d "$BB" ] || tar -C "$BUILD/busybox" -xf "$tarball"
-		say "configuring BusyBox"
-		make -C "$BB" defconfig >/dev/null
-		# Static, and no TC applet (it does not build against modern headers).
-		sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' "$BB/.config"
-		sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' "$BB/.config"
-		make -C "$BB" CROSS_COMPILE="$CROSS" oldconfig >/dev/null
-		say "building BusyBox (-j$JOBS)"
-		make -C "$BB" CROSS_COMPILE="$CROSS" -j "$JOBS" >/dev/null
-	fi
-	install -m 0755 "$BB/busybox" "$ROOT/bin/busybox"
-	ln -sf busybox "$ROOT/bin/sh"
-elif [ "${ROOTFS_BUSYBOX:-0}" = 1 ]; then
-	warn "${CROSS}gcc cannot link a libc - skipping BusyBox."
+	warn "no smolutils at $SMOLUTILS, nolibc-extensions at $NLEXT, or tarwak at
+  $TARWAK: the image will have no shell and no telnetd, so the board cannot be
+  driven.  Build tarwak (meson) or set TARWAK=."
 fi
 
 # ---- pack -------------------------------------------------------------------
+#
+# The initramfs is concatenated cpio archives, so it is assembled in pieces:
+#   1. the smolutils rootfs, converted tar -> newc cpio by bsdtar (this is the
+#      libarchive path that preserves the capability xattrs);
+#   2. the device nodes and the standalone SMP stress harness, which are not in
+#      the manifest, added with the kernel's gen_init_cpio.
+have bsdtar || die "missing 'bsdtar' (libarchive-tools) - run 'make deps'"
 
 say "packing $CPIO"
-( cd "$ROOT" && find . | LC_ALL=C sort |
-	cpio -o -H newc --owner=0:0 --quiet ) > "$CPIO"
-"$GEN" "$TOP/rootfs/dev.list" >> "$CPIO"
+if [ -f "$OUT/smol.tar" ]; then
+	bsdtar --format=newc -cf "$CPIO" @"$OUT/smol.tar"
+else
+	: > "$CPIO"
+fi
+
+# dev nodes (kernel needs /dev/console before /init) + init-smptest, appended
+# through gen_init_cpio, which can make device nodes without being root.
+EXTRA_MANIFEST="$OUT/extra.cpiolist"
+cat "$TOP/rootfs/dev.list" > "$EXTRA_MANIFEST"
+[ -f "$ROOT/init-smptest" ] &&
+	echo "file /init-smptest $ROOT/init-smptest 0755 0 0" >> "$EXTRA_MANIFEST"
+"$GEN" "$EXTRA_MANIFEST" >> "$CPIO"
 
 sz=$(wc -c < "$CPIO")
 say "initramfs: $sz bytes"
