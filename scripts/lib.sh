@@ -13,12 +13,13 @@ say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m==> warning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m==> error:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# A toolchain fetched with scripts/toolchain.sh lives here; put it on PATH so
-# the build scripts find it without the caller having to.
-if [ -d "$BUILD/toolchain/bin" ]; then
-	PATH="$BUILD/toolchain/bin:$PATH"
-	export PATH
-fi
+# A toolchain fetched with scripts/toolchain.sh, and host tools built by
+# scripts/hosttools.sh, live here; put both on PATH so the build scripts find
+# them without the caller having to.
+for d in "$BUILD/toolchain/bin" "$BUILD/hosttools/bin"; do
+	[ -d "$d" ] && PATH="$d:$PATH"
+done
+export PATH
 
 have() { command -v "$1" >/dev/null 2>&1; }
 

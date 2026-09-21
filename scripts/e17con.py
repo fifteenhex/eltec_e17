@@ -3,7 +3,7 @@
 
 The board's console is bridged by smolmqtt's serial2mqtt:
 
-    serial2mqtt -b 9600 -c 8N1 /dev/ttyUSB1 <broker> m68k/e17
+    serial2mqtt -b 9600 -c 8N1 /dev/ttyUSB1 <broker> m68k/e17/serial
 
 which publishes everything the board says to <topic>/rx and writes anything
 published to <topic>/tx out of the serial port.  This script is a dependency-
@@ -18,7 +18,7 @@ PINGREQ) wrapped in a few console-shaped commands.
 
 Options:
     --broker IP     default $E17_BROKER or 192.168.3.2
-    --topic BASE    default $E17_TOPIC  or m68k/e17
+    --topic BASE    default $E17_TOPIC  or m68k/e17/serial
     --quiet-for S   'cmd' stops when the board has been silent for S seconds
                     (default 1.5)
     --timeout S     hard limit for 'cmd'/'expect' (default 20)
@@ -34,7 +34,7 @@ import sys
 import time
 
 DEFAULT_BROKER = os.environ.get("E17_BROKER", "192.168.3.2")
-DEFAULT_TOPIC = os.environ.get("E17_TOPIC", "m68k/e17")
+DEFAULT_TOPIC = os.environ.get("E17_TOPIC", "m68k/e17/serial")
 
 
 def _rlen(n):

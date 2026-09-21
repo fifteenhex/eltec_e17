@@ -145,10 +145,10 @@ raw blast overruns it and drops records, which then F-lines in `gm`.
 
 The board's serial console is bridged to MQTT by smolmqtt's `serial2mqtt`:
 
-    serial2mqtt -b 9600 -c 8N1 /dev/ttyUSB1 <broker> m68k/e17
+    serial2mqtt -b 9600 -c 8N1 /dev/ttyUSB1 <broker> m68k/e17/serial
 
-which publishes what the board says to `m68k/e17/rx` and writes what you
-publish to `m68k/e17/tx` out of the port. `scripts/e17con.py` is a
+which publishes what the board says to `m68k/e17/serial/rx` and writes what
+you publish to `m68k/e17/serial/tx` out of the port. `scripts/e17con.py` is a
 dependency-free MQTT client wrapped around that:
 
     make console SECS=60                       # watch the console
@@ -156,7 +156,7 @@ dependency-free MQTT client wrapped around that:
     python3 scripts/e17con.py expect 'e17 =>' 120
 
 Broker and topic default to `$E17_BROKER` (192.168.3.2) and `$E17_TOPIC`
-(`m68k/e17`).
+(`m68k/e17/serial`).
 
 **Once Linux is up, the serial console is output-only** — nothing typed at it
 reaches the shell, because the CD2401 receive path is the very thing under
@@ -170,6 +170,27 @@ investigation. `/init` therefore starts BusyBox telnetd, and
 entropy source takes several minutes after boot. A connection that times out
 right after boot is that, not a dead network — wait for
 `random: crng init done` on the serial console.
+
+### Updating what the board boots
+
+The lab TFTP server cannot be reached directly: this container sits behind a
+NAT, and TFTP answers a request from a *new* source port, for which the NAT has
+no mapping (ordinary UDP is fine - DNS works - it is the port change that is
+fatal). So file transfer goes over MQTT instead, using smolmqtt's file bridge.
+
+In the lab, serving the TFTP root:
+
+    file2mqtt /path/to/tftproot <broker> m68k/e17/file
+
+From here:
+
+    mqttfile <broker> m68k/e17/file list
+    mqttfile <broker> m68k/e17/file put build/tftp/vmlinux.e17.stripped.lz4
+    mqttfile <broker> m68k/e17/file get vmlinux.e17.stripped.lz4 backup.lz4
+
+A push is written to `<name>.part` and only renamed over the live file once its
+size and CRC-32 match, so a half-finished transfer can never leave the board
+unbootable. `make push-kernel` does the staged kernel.
 
 ### Probing the hardware
 

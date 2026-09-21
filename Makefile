@@ -17,12 +17,16 @@ export BUILD TFTP CROSS CROSSTOOL_GCC JOBS
 export LINUX_DEFCONFIG UBOOT_DEFCONFIG
 export BUSYBOX_VERSION BUSYBOX_URL ROOTFS_INIT
 export RAM SMP VIDEO ROM NVRAM
+export MQTT_BROKER MQTT_TOPIC MQTT_FILE_TOPIC MQTTFILE E17_HOST
+export E17_BROKER=$(MQTT_BROKER)
+export E17_TOPIC=$(MQTT_TOPIC)
 
 S := $(CURDIR)/scripts
 
 .PHONY: help all deps toolchain sources qemu linux uboot rootfs boot-images \
         run-rmon run-uboot run-linux run-smptest probe-qemu probe-board \
-        tftp nvram console console-cmd shell clean distclean
+        tftp nvram hosttools console console-cmd shell push-kernel \
+        clean distclean
 
 help:
 	@sed -n '2,9p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
@@ -30,6 +34,7 @@ help:
 	@echo "Targets:"
 	@echo "  deps          install host build dependencies (apt, needs sudo)"
 	@echo "  toolchain     fetch the kernel.org m68k crosstool into build/toolchain"
+	@echo "  hosttools     build m4/bison/flex from source (no root needed)"
 	@echo "  sources       clone or update the QEMU / Linux / U-Boot forks"
 	@echo "  qemu          build qemu-system-m68k with the 'e17' machine"
 	@echo "  linux         build the kernel ($(LINUX_DEFCONFIG))"
@@ -50,6 +55,7 @@ help:
 	@echo "  console       watch the real board's serial console (SECS=30)"
 	@echo "  console-cmd   send one RMON command      CMD='db fec20600 10'"
 	@echo "  shell         run a command on the booted board over telnet"
+	@echo "  push-kernel   send the staged kernel to the lab TFTP root over MQTT"
 	@echo ""
 	@echo "  clean         remove build outputs (keeps fetched sources)"
 	@echo "  distclean     remove $(BUILD) entirely"
@@ -61,6 +67,9 @@ deps:
 
 toolchain:
 	$(S)/toolchain.sh
+
+hosttools:
+	$(S)/hosttools.sh
 
 sources:
 	$(S)/fetch-sources.sh
@@ -112,6 +121,14 @@ console-cmd:
 shell:
 	@test -n "$(CMD)" || { echo 'usage: make shell CMD="cat /proc/interrupts"'; exit 2; }
 	python3 $(S)/e17sh.py $(CMD)
+
+# Needs 'file2mqtt <tftproot> $(MQTT_BROKER) $(MQTT_FILE_TOPIC)' running in the
+# lab, and mqttfile from the smolmqtt tree (MQTTFILE=/path/to/mqttfile).
+push-kernel:
+	@test -f $(TFTP)/vmlinux.e17.stripped.lz4 || \
+		{ echo "no $(TFTP)/vmlinux.e17.stripped.lz4 - run 'make boot-images'"; exit 2; }
+	$(MQTTFILE) $(MQTT_BROKER) $(MQTT_FILE_TOPIC) put \
+		$(TFTP)/vmlinux.e17.stripped.lz4 vmlinux.e17.stripped.lz4
 
 clean:
 	rm -rf $(BUILD)/qemu $(BUILD)/linux $(BUILD)/u-boot $(BUILD)/rootfs \

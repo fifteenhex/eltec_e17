@@ -60,6 +60,18 @@ BUSYBOX_URL ?= https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.bz2
 # detected" under QEMU system emulation, so nolibc is the default.
 ROOTFS_INIT ?= nolibc
 
+# ---- the real board ---------------------------------------------------------
+
+# Serial console, bridged by smolmqtt's serial2mqtt.
+MQTT_BROKER ?= 192.168.3.2
+MQTT_TOPIC  ?= m68k/e17/serial
+# The lab's TFTP root, served by smolmqtt's file2mqtt (see docs/TESTING.md).
+MQTT_FILE_TOPIC ?= m68k/e17/file
+MQTTFILE    ?= /workspace/src/smolmqtt/mqttfile
+# The booted kernel's telnetd, which is how commands get in (the serial
+# console is output-only once Linux is up).
+E17_HOST    ?= 192.168.2.221
+
 # ---- QEMU run defaults ------------------------------------------------------
 
 RAM        ?= 32M
