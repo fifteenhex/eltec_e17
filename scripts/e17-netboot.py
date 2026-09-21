@@ -59,6 +59,9 @@ def main():
     ap.add_argument("--host", default=os.environ.get("E17_HOST",
                                                      "192.168.2.154"))
     ap.add_argument("--bootfile", default="e17/vmlinux.e17.stripped.lz4")
+    ap.add_argument("--bootargs", default=None,
+                    help="override the kernel command line for this boot only "
+                         "(setenv bootargs before run netboot)")
     ap.add_argument("--no-reboot", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--wait", type=float, default=300.0)
@@ -103,6 +106,14 @@ def main():
                 time.sleep(0.5)
                 m.publish(tx, b"setenv bootfile " + a.bootfile.encode() + b"\r")
                 time.sleep(1.5)
+                if a.bootargs:
+                    print(f"[overriding bootargs: {a.bootargs}]")
+                    # u-boot's simple CLI parser does not strip quotes; setenv
+                    # joins its args with single spaces, so send the command
+                    # line unquoted (it already uses single-space separators).
+                    m.publish(tx, b"setenv bootargs " +
+                              a.bootargs.encode() + b"\r")
+                    time.sleep(1.5)
                 m.publish(tx, b"run netboot\r")
                 stage = "booting"
                 seen = b""

@@ -114,3 +114,285 @@ exactly what the polled-mode work on e17-clean addresses.
 telnetd blocks until "random: crng init done", which on this machine took
 several minutes after boot - a connection refused/timing out right after boot
 is that, not a dead network.
+
+================================================================================
+2026-09-21 (later) - display getty, userspace DHCP, PF_KEY removal, vsync recheck
+================================================================================
+
+Deployed + verified on hardware (all now the permanent RMON-netbooted default):
+
+* Display getty: smolinit.getty=/dev/tty1 in the default bootargs.  init spawns
+  and respawns it; verified running (blocked at the securetty auth prompt, not
+  respawn-looping).  e17-kbd AT keyboard is present so a person at the display
+  can type.  Auth model kept: display login prints a one-time code on ttyS0
+  (serial) and asks for it back, same as telnet (user's choice).
+
+* Userspace network: replaced kernel ip=dhcp with smolinit.dhcpif=eth0.
+  startup runs "dhcpc -i eth0" (CONFIG_DHCP_WAIT=y blocks until the lease).
+  Verified eth0 = 192.168.2.154/24 + default route 192.168.2.1, all from
+  userspace dhcpc.  dhcpc was already in the rootfs manifest (feature "net").
+
+* PF_KEY removed: dropped CONFIG_NET_KEY (defconfig + .config).  Kernel no
+  longer registers the PF_KEY protocol family.
+
+* Deployment: no u-boot flash needed - the wrapped u-boot.e17boot (RMON netboot
+  header, load 0x600000) is pushed to the file bridge as u-boot.e17boot; RMON
+  TFTPs it as e17/u-boot.e17boot on reset.  Rebuilt u-boot (bootargs baked in),
+  pushed it, rebooted, and confirmed the NEW default bootargs boot with NO
+  override.  scripts/e17-netboot.py gained --bootargs for override testing.
+
+Files: u-boot/include/configs/e17.h (bootargs); linux .../eltec-e17_defconfig
+(+ .config) NET_KEY off; scripts/e17-netboot.py (--bootargs).
+
+--------------------------------------------------------------------------------
+vsync recheck (framebuffer): framebuffer console is NOT disabled - fbcon comes
+up fine on the default (e17_drm.vblank=0).  Findings on hardware vblank:
+
+* frame_irq=1 vblank=0 (counting-only): SAFE.  LM1882 frame IRQ (VIC LIRQ4,
+  IRQ 204) delivers rock-solid at ~56.8 Hz (9152 ints / 161 s).  Boots to
+  userspace, stable.  So frame-IRQ *delivery* is perfect.
+
+* frame_irq=1 vblank=1: HANGS the first fbdev commit.  Symptoms:
+    [drm] *ERROR* flip_done timed out  (CRTC/CONNECTOR/PLANE)
+    WARNING drm_crtc_wait_one_vblank+0xfe ... vblank wait timed out on crtc 0
+    Workqueue: events drm_fb_helper_damage_work
+  i.e. NOT a delivery problem - it is the DRM vblank/flip-done commit wiring.
+  The commit's flip event is armed on a vblank (e17_crtc_atomic_flush) that
+  deadlocks against the very commit that would start producing vblanks, and the
+  fbdev damage worker's drm_crtc_wait_one_vblank times out into a WARN storm.
+  Watchdog recovers the board every time (verified: single RMON reboot, no loop
+  - safety net works).  Default stays vblank=0.
+
+  Next step (needs an interactive session with the user available to recover):
+  boot once with drm.debug to trace where the first commit blocks; candidate
+  fix is to stop arming the flip event on vblank (send immediately, as the
+  vblank=0 fake-vblank path does) or to avoid the fbdev damage worker's
+  drm_crtc_wait_one_vblank.  Marginal benefit (tear-free 56 Hz console) vs the
+  solid vblank=0 default, so it stays opt-in.
+
+--- vsync root-cause, refined (drm.debug + bisect session, user standing by) ---
+Bisected the hardware-vblank hang.  It is NOT the frame IRQ and NOT the base
+DRM commit path.  It is an SMP stall: enabling DRM vblank (e17_drm.vblank=1)
+makes a vblank-waiting console/fbcon operation BUSY-stall CPU1 (its tick dies ->
+rcu_sched starved on cpu=1 -> RCU-stall panic -> self-recovers).  Two manifests:
+
+  * frame_irq=1 vblank=1: CPU1 stalls in the FIRST fbdev commit during drm
+    probe (earlier runs showed flip_done/vblank-wait timeouts; with drm.debug
+    the slow 9600-baud flood shifts timing and it stalls right after "VRAM
+    mapped", before "Initialized e17drm").  drm.debug is counter-productive
+    here - the serial flood perturbs the very timing under test.
+  * frame_irq=0 vblank=1 (hrtimer vblank): boots PAST fbcon ("colour frame
+    buffer" + userspace reached), then CPU1 stalls when getty opens/ioctls
+    /dev/tty1 (the fbcon VT):
+        Task dump for CPU 1: task:getty state:R running task pid:48
+        Call Trace: [<00148000>] sys_ioctl+0x638/0x6c4
+    i.e. CPU1 is *running* (busy) in the tty1 ioctl for 2100+ jiffies, not
+    sleeping - a spin/deadlock in the vblank-wait path, not a timeout.
+
+Controls: frame_irq=1 vblank=0 (counting-only) is rock-solid, IRQ at 56.8 Hz.
+vblank=0 default: getty-on-tty1 + fbcon + everything stable (verified again).
+So getty-on-tty1 is fine; the trigger is specifically vblank=1.
+
+Conclusion: hardware vsync on this dual-68040 needs the vblank-wait path to stop
+busy-stalling CPU1 - the same class of AP-tick/cross-CPU fragility as the other
+residual SMP issues, and deeper than a DRM-driver tweak.  Recommendation: keep
+vblank=0 (solid).  A real fix means making the vblank waiter sleep/pin correctly
+on this SMP tick, i.e. kernel SMP work with per-iteration (self-recovering)
+stall risk - a dedicated session, not a quick driver change.
+
+--- SMP vblank deadlock: ROOT-CAUSED and FIXED (hrtimer path) ---
+Tooling: switched to clankercontrol (clank) - `catch`, robust prompt match,
+securetty auth.  Added an "e17" target to clankercontrol/targets.toml.
+
+Root cause of the CPU1 tick-death (the "vblank=1 SMP stall"):
+  drm_crtc_vblank_start_timer() (custom hrtimer vblank in drm_vblank.c) had, in
+  its re-enable branch, a BLOCKING busy-loop:
+      while (hrtimer_active(&vtimer->timer))
+          hrtimer_try_to_cancel(&vtimer->timer);
+  drm_vblank_enable() calls this holding dev->vblank_time_lock with IRQs off.
+  The timer callback (drm_vblank_timer_function -> drm_crtc_handle_vblank ->
+  drm_handle_vblank) takes that SAME vblank_time_lock.  When the callback is
+  running on the other CPU as we enter start_timer:
+    CPU A: holds vblank_time_lock, spins in the while-loop for the callback
+           to finish (hrtimer_try_to_cancel keeps failing while it runs).
+    CPU B: the callback, spins for vblank_time_lock held by CPU A.
+  Cross-CPU deadlock, both IRQs off -> both ticks die -> rcu_sched starved ->
+  panic.  Nondeterministic (only when start_timer races a running callback),
+  which is why the stall point wandered (drm probe vs getty tty1 ioctl).
+  Confirmed via breadcrumb CPU1 last-tick PCs (spin_unlock_irqrestore, memcpy)
+  = CPU1 vanishing into an IRQs-off spin; drm_vblank_enable holds the lock
+  (assert_spin_locked(vbl_lock); spin_lock(vblank_time_lock)) and
+  drm_handle_vblank takes vblank_time_lock -- both verified in source.
+
+Fix (drivers/gpu/drm/drm_vblank.c): replace the blocking busy-loop with a
+  single non-blocking hrtimer_try_to_cancel(); hrtimer_start() below safely
+  re-arms an already-active timer, so no busy-wait and no deadlock.
+
+Verified on hardware (frame_irq=0 vblank=1, the hrtimer vblank path):
+  boots clean to userspace, fbcon colour-fb switch OK, vblank TICKS (100 fbcon
+  updates in ~13s, not ~100s of 1s timeouts), getty-on-/dev/tty1 alive (the
+  exact former deadlock trigger), survives a 60-update fbcon stress, ZERO RCU
+  stalls.  This is working hardware vsync via the hrtimer path -- and it is the
+  safer path on this board (no drm_crtc_handle_vblank in hard-IRQ context).
+
+Also hardened: drm_crtc_wait_one_vblank() timeout WARN (stack-dump storm on the
+  polled console) downgraded to a rate-limited debug note.
+
+STILL BROKEN (separate issue, NOT the start_timer deadlock):
+  frame_irq=1 vblank=1 (real LM1882-frame-ISR-driven vblank): boots clean but
+  HARD-hangs shortly after, when getty opens /dev/tty1 -- and the watchdog did
+  NOT recover it (board silent, needed a manual reset).  This path runs
+  drm_crtc_handle_vblank() from the frame ISR in hard-IRQ (IPL5) context; that
+  is a different hard-IRQ/cross-CPU hazard.  Recommendation: use the hrtimer
+  path for vsync (frame_irq=0 vblank=1); leave frame_irq-driven vblank off.
+  Kernel with both fixes pushed: crc f1666163.
+
+--- Remaining SMP race characterised: cross-CPU call (smp_call_function) ---
+UART-in-Linux status: serial RX enable works -- console_rx=1 ALONE boots clean
+to userspace (verified).  Adding a getty on /dev/ttyS0 hit a CPU1 tick-death
+stall 2/2 (self-recovered via RCU panic).  Root of THAT class is NOT the vblank
+deadlock (fixed) nor e17_smp_reg_lock (correct, irqsave everywhere).
+
+Aggregated CPU1 last-tick PCs across 24 stalls (breadcrumb 0xfec20600):
+  arch_cpu_idle           x15   (normal reboots, CPU1 idle -- not stalls)
+  _raw_spin_unlock_irqrestore x6 (CPU1 in a locked/irqs-off section)
+  smp_call_function_many_cond x1
+  memcpy x2, vprintk_store, read_lock/unlock_bh, alloc_vmap_area, console_flush_all
+CPU0 last-tick PCs during stalls: console_flush_all x12 (printing the panic),
+  smp_call_function_many_cond x3.
+
+Hypothesis (cross-call deadlock): on m68k spin_lock_irqsave raises IPL to 7,
+masking even the level-6 mailbox IPI.  If CPU1 spins in a locked section while
+CPU0 does smp_call_function() to it (e.g. a TLB flush from vmalloc/kdevtmpfs --
+alloc_vmap_area appears as a CPU1 PC, both CPUs appear in
+smp_call_function_many_cond), CPU1 cannot take the IPI and CPU0 spins in
+csd_lock_wait -> both wedged, ticks masked -> rcu_sched starved on cpu=1 ->
+RCU-stall panic.  Nondeterministic ("flaky early-boot kdevtmpfs stall"), which
+matches: it depends on a cross-call landing while the other CPU is IPL-7.
+
+This is the deep residual SMP item.  Fixing it means making cross-CPU calls not
+deadlock against an IPL-7 spinning peer -- e.g. auditing which paths hold a lock
+across a cross-call, or an IPI that survives IPL7 (level 7 is NMI/edge on m68k).
+A multi-session instrumentation job, not a one-liner.  Recommend: keep
+console_rx=0 default (output-only serial) until this is cracked; the telnet path
+is the interactive way in.  DELIVERED THIS SESSION: the vblank start_timer
+deadlock fix (drm_vblank.c) + the wait_one_vblank WARN-storm downgrade.
+
+--- UART-in-Linux: serial RX partially works, blocked by the cross-call race ---
+Confirmed on hardware with console_rx=1 + smolinit.getty=/dev/ttyS0
+(securetty=/dev/ttyS0 makes it a direct login, no code):
+  * The serial getty comes up: "smolsh / >" appears on ttyS0 and it ANSWERS a
+    bare Enter with a fresh prompt -- so CD2401 RX delivery works.
+  * But sending an actual command ("id") coincided with a reset (RMON "System
+    Autoboot" appeared) -- RX comes up but destabilises under real input.
+  * The boot itself hits the flaky early-boot cross-call stall (~2/3 attempts);
+    it is pre-userspace, so NOT caused by the getty.
+Both symptoms point at the same deep cross-call/IPI race (above), not a CD2401
+driver bug per se.  So: interactive serial console is *close* -- the driver and
+getty are right -- but it needs the cross-call SMP race fixed to be reliable.
+Until then keep console_rx=0 (output-only) + telnet as the way in.
+
+u-boot CBSIZE note: the CLI rejects a setenv line >=256 chars ("Command too
+long!").  The full production bootargs (console_rx + both gettys) exceeds that
+when typed, but fits fine baked into CFG_EXTRA_ENV_SETTINGS -- only interactive
+setenv is limited.  For testing, trim to one getty / drop console=tty0.
+
+--- Cross-call fix attempt #1: per-tick IPI backstop (needs a power cycle to test) ---
+Hypothesis (above): with HW_IPI a lost/coalesced doorbell edge leaves an IPI bit
+undrained; a busy CPU never idles to run the idle-loop poll, so an
+smp_call_function() at it hangs in csd_lock_wait -> the cross-call stall.
+
+Fix applied (arch/m68k/eltec/config.c): call e17_ipi_poll() every tick on BOTH
+CPUs (e17_timer_int + e17_ap_tick), not just in the !HW_IPI baseline.  It is
+cheap (non-locked peek returns at once when the bitmap is empty), so it just
+bounds a lost IPI to one tick instead of a permanent hang.  Kernel pushed: crc
+87a86d3c.  (Caveat: only helps when the target CPU's tick still fires; a CPU
+spinning at IPL7 in a lock is not covered.)
+
+COULD NOT VALIDATE: a 5-boot reliability run gave clean:2 stall:3 -- but the
+board is in the "accumulated flaky state" the earlier notes describe, which
+climbs with every SOFT reset (e17_reset/watchdog) and, per this session's
+history, only a HARDWARE POWER CYCLE clears.  It was ~50% earlier and ~60% now
+after many soft resets.  Against a dirty baseline a working fix still shows
+stalls, so the result is inconclusive.  NEED: a power cycle to get a clean
+baseline, then re-run the 5-boot test (expect near-0 stalls if the backstop
+helps; if stalls persist clean, the mechanism is an IPL7-spin, not a lost IPI).
+
+--- UART blocker is a SEPARATE bug: CD2401 RX-poll IACK whole-bus hang ---
+Runtime cross-call stress with the IPI backstop kernel (crc 87a86d3c): the board
+survived 400 sequential fork/TLB-flush cross-calls AND 4 concurrent fork loops
+for ~55s, uptime climbing, ZERO stalls.  So at RUNTIME the cross-call path is
+robust now.
+
+But the serial UART is blocked by a DIFFERENT fault.  With console_rx=1 + getty
+on ttyS0: a clean boot came up first try, the serial shell answered Enter, took
+~2 inputs, then the board died with "### Watchdog Reset" (NOT an RCU-stall panic)
+-- breadcrumb "whole-bus hang (both CPUs froze)", both CPUs idle at their last
+tick.  A whole-bus hang with both CPUs idle => the hang is in the post-tick
+softirq, i.e. the CD2401 RX poll timer's IACK:
+    e17_cd2401_rx_poll(): readb(up->iack + CD2401_RX_IPL)  // the code's own
+    comment: "no-DTACK here = whole-bus hang"
+LIRQ6 is a shared self-vectored daisy chain (CD2401 rx/tx/modem + CIOs); the poll
+gates the IACK on LICR6 STATE, but STATE is shared, so a mistimed RX IACK gets no
+DTACK (this board has no bus-error timeout) and locks the bus -> watchdog reset.
+Fixing it means draining RX in poll mode WITHOUT that VIC IACK (select the
+channel via CD2401_CAR and read RFOC/RDR directly), but RISR/RFOC/DR may be
+service-context registers -- needs the CD2401 datasheet to get right, and every
+test whole-bus-hangs the board.  Separate multi-session task from the SMP work.
+
+SUMMARY of the two remaining deep issues:
+  1. SMP cross-call / early-boot stall -> RCU-stall panic (CPU1 tick death).
+     IPI backstop added; runtime-robust; boot-rate validation needs a POWER
+     CYCLE (accumulated soft-reset state, ~50-60% boot stall).
+  2. CD2401 RX-poll IACK -> whole-bus hang (watchdog reset) under serial input.
+     The actual UART-interactive blocker.  Needs a no-IACK poll drain.
+
+=== UART-in-Linux: WORKED OUT and deployed (poll=0 interrupt RX) ===
+Root cause of the serial whole-bus hang: it was the POLL-MODE manual IACK, not a
+fundamental CD2401 problem.  poll=1 (old default) keeps LIRQ6 masked and drains
+RX from a timer that issues a manual software-IACK gated on the *shared* LIRQ6
+STATE pin; a CIO on the same self-vectored daisy chain can assert STATE with no
+CD2401 RX posted, so the IACK gets no DTACK (no bus-error timeout on this board)
+-> whole-bus hang -> watchdog reset.
+
+FIX (no code change -- the interrupt path already existed and was correct):
+serial_e17_cd2401.poll=0 uses interrupt-driven RX.  The CD2401 only raises LIRQ6
+when it actually has data; the CPU takes a real level-5 IACK and the driver
+dispatches on the returned vector type (the earlier shared-PILR "type a word and
+die" fix), so a CIO interrupt lands on the CIO handler, never a phantom RX IACK.
+
+Verified on hardware: poll=0 + console_rx=1 + getty on /dev/ttyS0 =
+  * clean boot, interactive serial LOGIN on ttyS0 (direct login: ttyS0 is the
+    securetty, so no one-time code);
+  * 10/10 then 39/40 rapid serial commands echo AND execute, NO reset;
+  * survived ~3.7 min including idle (no "rare idle hang");
+  * confirmed as the PERMANENT DEFAULT: rebuilt u-boot with the bootargs baked in
+    (poll=0 + console_rx=1 + smolinit.getty=/dev/ttyS0), pushed u-boot.e17boot
+    (crc 9475a3cd); RMON netboots it and "run netboot" (no override) comes up
+    with a working serial console.
+
+So the E17 now has THREE ways in: serial getty (ttyS0), display getty (tty1),
+telnet -- all on the default boot.  Remaining deep item: the ~50-60% early-boot
+RCU-stall flakiness (accumulated soft-reset state; IPI backstop added, runtime-
+robust; boot-rate A/B still wants a power cycle for a clean baseline).
+
+--- UART deploy: fixed a COMMAND_LINE_SIZE truncation that killed telnetd ---
+After baking poll=0+console_rx=1+ttyS0 getty into the default bootargs, telnetd
+stopped starting ("startup: No secure console at : 2" -> "init: not starting
+telnetd").  Cause: m68k COMMAND_LINE_SIZE is 256 (arch/m68k/include/uapi/asm/
+setup.h) and the full bootargs was 265 chars, so the kernel truncated the tail
+and lost smolinit.securetty=/dev/ttyS0.  With no securetty, auth_check() allows
+everyone (serial "login" worked but with NO code) and init refuses to start
+telnetd -- silently dropping BOTH telnet access and the security model.
+Fix: drop "sysctl.kernel.panic_on_rcu_stall=1" from bootargs (it is already a
+build-time default in kernel/rcu/tree_stall.h), bringing the line to 230 chars.
+u-boot rebuilt + pushed (crc 4a7d1ad1).
+
+Final verified state on the PERMANENT DEFAULT (no overrides, RMON-netbooted):
+  * clean boot; BI_COMMAND_LINE ends with securetty=/dev/ttyS0 (not truncated);
+  * serial console: interactive login on ttyS0, commands echo+run (poll=0);
+  * telnet: reachable, prompts the one-time securetty code (61f5b9) and runs
+    commands -> telnetd up AND the securetty auth model intact;
+  * display getty on tty1 present.
+Three independent ways in (serial / display / telnet), all on the default boot.
+UART-in-Linux: DONE.
