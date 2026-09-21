@@ -767,7 +767,7 @@ index f1ecda53c66..5e0a6fe365d 100644
  
  int dram_init(void)
 diff --git a/include/configs/e17.h b/include/configs/e17.h
-index fd4836e61a7..6fd3c6b1c39 100644
+index fd4836e61a7..0e307f6188f 100644
 --- a/include/configs/e17.h
 +++ b/include/configs/e17.h
 @@ -26,12 +26,66 @@
@@ -833,7 +833,7 @@ index fd4836e61a7..6fd3c6b1c39 100644
 +		"autoload=no\0" \
 +		"bootfile=e17/vmlinux.e17.stripped.lz4\0" \
 +		"initrd_file=e17-rootfs.cpio\0" \
-+		"bootargs=console=tty0 console=ttyS0 ip=dhcp panic_on_rcu_stall=1 panic=10 e17_idle=spin\0" \
++		"bootargs=console=tty0 console=ttyS0 ip=dhcp e17_idle=spin panic=10 -- smolinit.telnetd=23 smolinit.securetty=/dev/ttyS0\0" \
 +		"nfetch=dhcp; " \
 +			"tftp ${loadaddr} ${bootfile}; crc32 ${loadaddr} ${filesize}\0" \
 +		"nprep=unlz4 ${loadaddr} ${bootaddr} ${dstsize}\0" \

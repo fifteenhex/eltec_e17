@@ -175,3 +175,52 @@ Final artifacts pushed (file2mqtt m68k/e17/files):
                                            e17_idle=spin via bootargs, wdt pet,
                                            breadcrumb ungated, getty+/run, init
                                            sets panic_on_rcu_stall)
+
+
+==========================================================================================
+ADDENDUM - smolutils master migration + working reboot (same session)
+==========================================================================================
+
+USERSPACE now builds from smolutils master via its own manifest:
+ - build-rootfs.sh builds smolutils (Makefile.m68kmmu CPU=68040 NOPIE=1) and
+   lays the rootfs out with tarwak + rootfs.tarwak.json (bsdtar -> newc cpio):
+   /lib/smol multicall binaries, /bin+/sbin symlink farm, /init -> /sbin/init,
+   and file capabilities.  Device nodes + init-smptest appended via
+   gen_init_cpio.  Needs bsdtar and tarwak (meson).
+ - Proper root: getty drops the login to uid 1024; `su` regains root from a
+   cap_setuid file capability that smolutils' startup applies at boot.  That
+   needs CONFIG_TMPFS_XATTR (added) so the initramfs rootfs can hold the
+   security.capability xattr - without it startup logged "Failed to label
+   /bin/su: 95" and su could not work.
+ - Auth: telnet login and su each print a random code on the securetty (the
+   serial console, smolinit.securetty=/dev/ttyS0) and ask for it back.  The
+   serial console is output-only (console_rx=0), so the code appears on
+   serial2mqtt; scripts/e17-telnet.py reads it from build/console.log and
+   answers.  VERIFIED: telnet -> uid 1024 -> su -> Uid: 0 0 0 0 (root).
+ - bootargs: "... e17_idle=spin panic=10 -- smolinit.telnetd=23
+   smolinit.securetty=/dev/ttyS0".  No serial getty (console is output-only).
+
+REBOOT now works (it did not before):
+ - mach_reset was never set for E17, so machine_restart fell through to for(;;)
+   - and because the watchdog hard-petter runs from BOTH CPUs' ticks, CPU0
+   going quiet was not enough; CPU1 kept petting and the board sat in reboot
+   forever (observed: "reboot: Restarting system" then a pinging-but-dead
+   board).  Fixed: mach_reset = e17_reset, which parks the secondary (CPU2CON
+   SRESET=0, stopping its tick+petting) then spins with IRQs off; the watchdog
+   then fires a full SYSRESET -> RMON -> u-boot.  VERIFIED: `reboot` as root
+   resets the board to the u-boot prompt.
+
+Net effect: fully self-service now - su to root, reboot to reset, netboot from
+u-boot - no hardware reset needed for normal iteration.
+
+Tooling added to the repo (the sandbox wipes /tmp): scripts/e17-conlog.py
+(persistent capped console logger -> build/console.log) and
+scripts/e17-telnet.py (auth-aware telnet client, --root to su).
+
+Patches refreshed: patches/e17-uboot-uart-watchdog.patch and
+patches/e17-linux-uart-watchdog-lockup.patch (kernel side; also needs
+CONFIG_TMPFS_XATTR=y).
+
+Still open: robust serial console RX under load (console_rx=0 by default); the
+whole-bus cross-call hang under heavy cross-call load (distinct from reboot,
+which is now fixed); MAC PROM decode (04:00:04:00:04:00); QEMU model.

@@ -1,0 +1,400 @@
+diff --git a/arch/m68k/eltec/config.c b/arch/m68k/eltec/config.c
+index 90ce534eb85e..b71b9bca0915 100644
+--- a/arch/m68k/eltec/config.c
++++ b/arch/m68k/eltec/config.c
+@@ -30,6 +30,7 @@
+ #include <asm/traps.h>
+ #include <linux/font.h>		/* font_vga_8x8 for the framebuffer boot console */
+ #include <linux/e17_breadcrumb.h>
++#include <linux/e17_wdt.h>
+ #ifdef CONFIG_SMP
+ #include <asm/smp_e17.h>
+ #endif
+@@ -50,6 +51,52 @@
+  */
+ #define E17_POST(code)	(*(volatile u8 *)0xfec30000 = (code) & 0x0f)
+ 
++/*
++ * Board watchdog ($FEC5.0000, HW manual 3.8).  Any write pets it; the value is
++ * ignored.  The first write ARMS it, and nothing but a reset can switch it off
++ * again, so petting is a commitment: once anyone has written here, something
++ * must keep writing at least every 1.6 s (jumper J1401) or the board resets.
++ *
++ * u-boot now arms it before handing over - it is the only way back from a
++ * wedged bus, which on this board is otherwise a trip to the power switch - so
++ * the kernel inherits a running watchdog and has no choice but to feed it.
++ * Coverage from the kernel's first instruction to the watchdog driver taking
++ * over comes from, in order: head.S at entry, config_eltec_e17() below, the
++ * 100 Hz tick, and the CD2401 console write.
++ */
++#define E17_WDT		((volatile u8 *)0xfec50000)
++
++void e17_wdt_pet(void)
++{
++	*E17_WDT = 0;
++}
++EXPORT_SYMBOL(e17_wdt_pet);
++
++/*
++ * Reset the board (mach_reset, i.e. reboot/restart).
++ *
++ * There is no software reset register; the board's only reset source we can
++ * provoke is the watchdog, which drives a full SYSRESET.  It is already armed
++ * (u-boot armed it, the kernel keeps it fed), so a reset is just "stop feeding
++ * it".  But the feed is per-CPU - the hard-IRQ petter runs from each CPU's
++ * tick - so CPU0 going quiet is not enough: CPU1 would keep petting and the
++ * board would sit in reboot forever (exactly the hang seen before this
++ * existed).  So hold the secondary in reset first (CPU2CON SRESET=0, the same
++ * write the SMP offline path uses to park it), which stops its tick and its
++ * petting, then drop into a quiet loop with interrupts off.  With nobody
++ * feeding it the watchdog fires within the jumper period (<=1.6 s) and resets
++ * the whole board back through RMON.
++ */
++#define E17_CPU2CON	((volatile u8 *)0xfec58000)	/* bit5 SRESET: 0=hold */
++
++void e17_reset(void)
++{
++	local_irq_disable();
++	*E17_CPU2CON = 0x00;		/* SRESET=0: park the secondary */
++	for (;;)
++		/* starve the watchdog; it resets the board */;
++}
++
+ /*
+  * Watchdog-reset breadcrumb in the battery-backed M48T02 NVRAM (offset 0x600 --
+  * past RMON's 0x000-0x5ff system area, below the clock registers), so it survives
+@@ -645,12 +692,19 @@ static irqreturn_t e17_timer_int(int irq, void *dev_id)
+ 	 */
+ 	E17_BC[E17_BC_IRQERR] = atomic_read(&irq_err_count);
+ 	/*
+-	 * NB: do NOT read the 0xfec50000 watchdog/ack block here.  The hardware
+-	 * IACK re-arms the tick; that read is not needed, and per the HW manual
+-	 * the first access to the watchdog block ARMS the watchdog -- which then
+-	 * resets the board the moment the tick stalls (e.g. on a crash).  Leave
+-	 * the watchdog disabled for now.
++	 * Pet the watchdog from the tick.  This used to be deliberately omitted,
++	 * on the grounds that arming it would reset the board the moment the
++	 * tick stalled.  That is now exactly what we want - a stalled tick means
++	 * a wedged CPU or bus, and the reset is the only way back - and in any
++	 * case the choice is gone: u-boot arms the watchdog before handing over
++	 * and the hardware cannot be disarmed.
++	 *
++	 * Petting from the tick (rather than only from the watchdog driver's
++	 * kthread) means the feed survives anything that delays scheduling, so
++	 * the watchdog fires for genuine hangs and not for a busy board.
+ 	 */
++	e17_wdt_pet();
++
+ 	legacy_timer_tick(1);
+ #ifdef CONFIG_SMP
+ 	/*
+@@ -861,9 +915,13 @@ static void __init eltec_e17_init_IRQ(void)
+ 
+ void __init config_eltec_e17(void)
+ {
++	/* setup_arch() time: still a long way before the tick starts feeding it. */
++	e17_wdt_pet();
++
+ 	mach_init_IRQ	= eltec_e17_init_IRQ;
+ 	mach_sched_init	= eltec_e17_sched_init;
+ 	mach_get_model	= eltec_e17_get_model;
++	mach_reset	= e17_reset;		/* reboot via the watchdog */
+ 
+ 	if (!vme_brdtype)
+ 		vme_brdtype = VME_TYPE_E17;
+diff --git a/arch/m68k/eltec/eltec.h b/arch/m68k/eltec/eltec.h
+index fe47ec0cf2cc..e6bbaaac411f 100644
+--- a/arch/m68k/eltec/eltec.h
++++ b/arch/m68k/eltec/eltec.h
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ void config_eltec_e17(void);
++
+ int eltec_e17_parse_bootinfo(const struct bi_record *record);
+ 
+ #ifdef CONFIG_SMP
+diff --git a/arch/m68k/kernel/head.S b/arch/m68k/kernel/head.S
+index e0e271349fcd..db8c3315fbb4 100644
+--- a/arch/m68k/kernel/head.S
++++ b/arch/m68k/kernel/head.S
+@@ -609,6 +609,16 @@ ENTRY(__start)
+ 	 * (0xee would enable only bit0 and leave the digit garbled).
+ 	 */
+ 	moveb	#0x0e,0xfec30000
++	/*
++	 * Pet the board watchdog at the first possible instruction.  u-boot
++	 * arms it ($FEC5.0000) before jumping here and the hardware cannot be
++	 * disarmed, so the clock is already running against us: without this
++	 * the board resets partway through early boot, before the console
++	 * exists to say so.  Any write pets; like the POST latch above this is
++	 * a plain absolute access, which works because the I/O window is
++	 * reachable before the MMU is set up.
++	 */
++	moveb	#0,0xfec50000
+ #endif
+ 
+ /*
+diff --git a/arch/m68k/kernel/process.c b/arch/m68k/kernel/process.c
+index 7ffb56240bf0..1c40fe94cdcd 100644
+--- a/arch/m68k/kernel/process.c
++++ b/arch/m68k/kernel/process.c
+@@ -46,25 +46,50 @@
+ asmlinkage void ret_from_fork(void);
+ asmlinkage void ret_from_kernel_thread(void);
+ 
++#ifdef CONFIG_SMP
++/*
++ * E17 idle policy, selectable with the boot argument e17_idle=:
++ *
++ *   halt  (default)  stop #0x2000, like every other m68k.  With HW_IPI a
++ *                    pending doorbell is latched and taken the instant stop
++ *                    drops the IPL.
++ *   spin             never halt: drain the IPI bitmap and busy-spin briefly,
++ *                    then return to the idle loop so it re-checks need_resched.
++ *                    The spin is REGISTER-ONLY (no memory/bus access) so it does
++ *                    not saturate the shared local bus.
++ *
++ * The spin form is the poll-only baseline's idle, and it has one property halt
++ * lacks: it cannot get permanently stuck, because it always returns.  A
++ * watchdog breadcrumb has caught CPU0 wedged in stop with its own (non-maskable,
++ * level-7) tick stopped while CPU1 kept ticking - i.e. the 68040 not resuming
++ * from stop.  e17_idle=spin sidesteps that; making it a boot arg means the two
++ * can be compared on the same kernel to pin the mechanism down rather than
++ * guessed at.
++ */
++enum e17_idle_mode { E17_IDLE_HALT, E17_IDLE_SPIN };
++static enum e17_idle_mode e17_idle = E17_IDLE_HALT;
++
++static int __init e17_idle_setup(char *s)
++{
++	if (!strcmp(s, "spin"))
++		e17_idle = E17_IDLE_SPIN;
++	else if (!strcmp(s, "halt"))
++		e17_idle = E17_IDLE_HALT;
++	return 1;
++}
++__setup("e17_idle=", e17_idle_setup);
++#endif
++
+ void arch_cpu_idle(void)
+ {
+ #ifdef CONFIG_SMP
+ 	/*
+-	 * E17 SMP: with CONFIG_E17_SMP_HW_IPI both doorbells are real, hardware-
+-	 * confirmed IRQs -- the CPU2CON mailbox (pri->sec, level 6) and the VIC
+-	 * ICMS module switch (sec->pri, IRQ_USER).  Idle then just halts on stop
+-	 * like every other m68k: a pending IPI is latched (MIPEND / the ICFSR
+-	 * switch bit) and taken the instant stop drops the IPL, and IPIs run through
+-	 * the normal interrupt-entry path so RCU idle bookkeeping stays correct.
+-	 *
+-	 * Without HW_IPI there is no doorbell IRQ, so fall back to the poll-only
+-	 * baseline: drain the pending bitmap here and busy-spin instead of halting.
+-	 * The spin is REGISTER-ONLY (no memory/bus access) so the AP does not
+-	 * saturate the shared local bus between polls -- a poll loop touching
+-	 * DRAM/I/O every iteration starves CPU0's VRAM/console and the video
+-	 * scanout (hard bus lock).  IPI latency stays in the low microseconds.
++	 * Poll-only builds (no HW_IPI doorbell) must spin regardless, since
++	 * there is no interrupt to wake a halted CPU for an IPI at all.  With
++	 * HW_IPI, honour the e17_idle policy above.
+ 	 */
+-	if (MACH_IS_E17 && !IS_ENABLED(CONFIG_E17_SMP_HW_IPI)) {
++	if (MACH_IS_E17 &&
++	    (!IS_ENABLED(CONFIG_E17_SMP_HW_IPI) || e17_idle == E17_IDLE_SPIN)) {
+ 		unsigned int d = 8192;
+ 
+ 		e17_ipi_poll();
+diff --git a/drivers/tty/serial/serial_e17_cd2401.c b/drivers/tty/serial/serial_e17_cd2401.c
+index 07fa8ac13d12..786cf850d378 100644
+--- a/drivers/tty/serial/serial_e17_cd2401.c
++++ b/drivers/tty/serial/serial_e17_cd2401.c
+@@ -25,6 +25,7 @@
+ 
+ #include <linux/console.h>
+ #include <linux/e17_breadcrumb.h>
++#include <linux/e17_wdt.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+@@ -120,6 +121,29 @@ module_param(poll, bool, 0444);
+ MODULE_PARM_DESC(poll,
+ 	"Fully-polled, no CD2401 interrupts (default 1; 0 = interrupt-driven)");
+ 
++/*
++ * Console receive, off by default.
++ *
++ * The CD2401 receive path is the board's oldest hazard: this UART shares the
++ * self-vectored LIRQ6 daisy chain and the board has no bus-error timeout, so a
++ * receive service that steps on an un-answered bus cycle does not fault
++ * cleanly - under sustained input it drives CPU0 into a double-fault halt
++ * (bus still live, CPU1 still ticking; only the watchdog recovers).  Light
++ * interactive use survives, heavy or concurrent input does not, which is why
++ * the console has always been "output-only in practice".
++ *
++ * So the console defaults to output-only: transmit (kernel messages, the shell
++ * prompt) is solid, and nothing on the receive side can wedge the machine.
++ * The intended way in once Linux is up is telnet (init starts telnetd).  Set
++ * serial_e17_cd2401.console_rx=1 to accept keyboard input on the serial
++ * console anyway, understanding the hazard above.
++ */
++static bool console_rx;
++module_param(console_rx, bool, 0444);
++MODULE_PARM_DESC(console_rx,
++	"Accept input on the serial console (default 0 = output-only; input is "
++	"via telnet).  1 re-enables RX, which can wedge the board under load.");
++
+ /* RX poll period.  Timer granularity is one jiffy (HZ=100 -> 10 ms). */
+ #define E17_CD2401_POLL_JIFFIES	1
+ /* Max RX service contexts drained per poll, so a fast sender can't hog the lock. */
+@@ -299,7 +323,21 @@ static bool e17_cd2401_tx_one_irq(struct e17_cd2401_port *up, u8 ch)
+ /* Returns true if the byte was handed to the chip, false if it did not respond. */
+ static bool e17_cd2401_tx_one(struct e17_cd2401_port *up, u8 ch)
+ {
+-	if (txirq)
++	/*
++	 * In poll mode transmit MUST take the polled path, whatever txirq says.
++	 *
++	 * The interrupt-mode putchar reprograms all three PILRs to the shared
++	 * 0xfb window.  Poll mode, though, gave receive its own private window
++	 * (RPILR == CD2401_RX_IPL) and the rx timer acknowledges at exactly
++	 * that level - so the first console write silently moves the goalposts,
++	 * every later acknowledge matches no PILR, and receive stops dead with
++	 * no sign of why.  Since poll and txirq both default on, that was the
++	 * shipping configuration: a console that could print but never listen.
++	 *
++	 * txirq only chooses how TX is done when interrupts are in use at all,
++	 * which is what poll=0 means.
++	 */
++	if (txirq && !poll)
+ 		return e17_cd2401_tx_one_irq(up, ch);
+ 	return e17_cd2401_tx_one_polled(up, ch);
+ }
+@@ -598,8 +636,20 @@ static int e17_cd2401_startup(struct uart_port *port)
+ 		 */
+ 		cd_write(port, CD2401_RPILR, CD2401_RX_IPL);
+ 		cd_write(port, CD2401_TPILR, CD2401_TX_IPL);
+-		cd_write(port, CD2401_CCR, CD2401_CCR_ENBRX | CD2401_CCR_ENBXMTR);
+-		cd_write(port, CD2401_IER, CD2401_IER_RXD);
++		/*
++		 * Enable the transmitter always; the receiver only when console_rx
++		 * asks for it.  With RX off we neither ENBRX nor post IER.RxD, so the
++		 * chip never asserts on receive and the poll timer below is not even
++		 * started - the console cannot wedge on input.
++		 */
++		if (console_rx) {
++			cd_write(port, CD2401_CCR,
++				 CD2401_CCR_ENBRX | CD2401_CCR_ENBXMTR);
++			cd_write(port, CD2401_IER, CD2401_IER_RXD);
++		} else {
++			cd_write(port, CD2401_CCR, CD2401_CCR_ENBXMTR);
++			cd_write(port, CD2401_IER, 0);
++		}
+ 		up->tx_idle = true;
+ 		uart_port_unlock_irqrestore(port, flags);
+ 
+@@ -612,8 +662,12 @@ static int e17_cd2401_startup(struct uart_port *port)
+ 		licr = readb(up->vic + E17_VIC_LICR6);
+ 		writeb(licr | E17_VIC_LICR_MASK, up->vic + E17_VIC_LICR6);
+ 
+-		timer_setup(&up->rx_poll_timer, e17_cd2401_rx_poll, 0);
+-		mod_timer(&up->rx_poll_timer, jiffies + E17_CD2401_POLL_JIFFIES);
++		/* No receive -> no poll timer -> nothing that can wedge on input. */
++		if (console_rx) {
++			timer_setup(&up->rx_poll_timer, e17_cd2401_rx_poll, 0);
++			mod_timer(&up->rx_poll_timer,
++				  jiffies + E17_CD2401_POLL_JIFFIES);
++		}
+ 		return 0;
+ 	}
+ 
+@@ -706,7 +760,8 @@ static void e17_cd2401_shutdown(struct uart_port *port)
+ 	unsigned long flags;
+ 
+ 	if (poll) {
+-		timer_delete_sync(&up->rx_poll_timer);	/* no callback after this */
++		if (console_rx)
++			timer_delete_sync(&up->rx_poll_timer);	/* if it was started */
+ 		uart_port_lock_irqsave(port, &flags);
+ 		cd_write(port, CD2401_CAR, 0);
+ 		cd_write(port, CD2401_IER, 0);		/* stop posting RX */
+@@ -800,10 +855,19 @@ static void e17_cd2401_console_write(struct console *co, const char *s,
+ 		return;
+ 	port = &up->port;
+ 
++	/*
++	 * Pet the watchdog around every console record.  u-boot arms it before
++	 * the kernel starts, and printk is the one thing that reliably happens
++	 * throughout early boot - including the stretches before the tick
++	 * starts feeding it.  Writing a long record at 9600 baud is itself
++	 * slow enough to matter, hence the pet on both sides.
++	 */
++	e17_wdt_pet();
+ 	up->console_wedged = false;	/* fresh chance for this record */
+ 	uart_port_lock_irqsave(port, &flags);
+ 	uart_console_write(port, s, count, e17_cd2401_putchar);
+ 	uart_port_unlock_irqrestore(port, flags);
++	e17_wdt_pet();
+ }
+ 
+ static int e17_cd2401_console_setup(struct console *co, char *options)
+diff --git a/drivers/watchdog/e17_wdt.c b/drivers/watchdog/e17_wdt.c
+index 07e676eb62c6..e1a934a9b6cf 100644
+--- a/drivers/watchdog/e17_wdt.c
++++ b/drivers/watchdog/e17_wdt.c
+@@ -200,11 +200,23 @@ static int e17_wdt_probe(struct platform_device *pdev)
+ 	 * CIO driver mapping the same chip.
+ 	 */
+ 	pa7 = devm_ioremap(dev, E17_WDT_PA7_PHYS, 1);
+-	if (pa7 && !(readb(pa7) & E17_WDT_PA7)) {
+-		u8 bc[E17_BC_LEN];
+-
++	if (pa7 && !(readb(pa7) & E17_WDT_PA7))
+ 		w->wdd.bootstatus |= WDIOF_CARDRESET;
+ 
++	/*
++	 * Report the breadcrumb on its own evidence, not on PA7.
++	 *
++	 * PA7 is not trustworthy here: RMON runs between the reset pulse and us,
++	 * and its own watchdog petting clears the front-panel indication, so on a
++	 * netbooted board PA7 reads 1 even after a genuine watchdog reset.  Gating
++	 * the dump on it threw away the entire post-mortem for exactly the hangs it
++	 * exists to explain.  The breadcrumb carries its own validity magic, so it
++	 * can speak for itself; PA7 still decides WDIOF_CARDRESET, which is a
++	 * different question.
++	 */
++	{
++		u8 bc[E17_BC_LEN];
++
+ 		/*
+ 		 * Pre-reset breadcrumb (arch/m68k/eltec/config.c).  bc[1]=CPU0 tick
+ 		 * heartbeat, bc[2]=CPU1 tick heartbeat, bc[3]=CPU1's heartbeat at CPU0's
+diff --git a/include/linux/e17_wdt.h b/include/linux/e17_wdt.h
+new file mode 100644
+index 000000000000..8ed3dd300e65
+--- /dev/null
++++ b/include/linux/e17_wdt.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * ELTEC EUROCOM-17 board watchdog, petting side.
++ *
++ * The watchdog at $FEC5.0000 is armed by the first write to it and cannot be
++ * switched off again by software - only a reset stops it.  u-boot arms it
++ * before handing over, because a wedged bus on this board is otherwise
++ * unrecoverable without power-cycling the crate, so the kernel inherits a
++ * running watchdog from its very first instruction and has to keep feeding it.
++ *
++ * The watchdog driver (drivers/watchdog/e17_wdt.c) takes over once it probes.
++ * Until then the feeding is done by head.S at entry, config_eltec_e17(), the
++ * 100 Hz tick and the console write path - so anything that introduces a new
++ * multi-second stretch of early boot needs a call in it too.
++ */
++#ifndef _LINUX_E17_WDT_H
++#define _LINUX_E17_WDT_H
++
++#if IS_ENABLED(CONFIG_ELTEC_E17)
++void e17_wdt_pet(void);
++#else
++static inline void e17_wdt_pet(void) { }
++#endif
++
++#endif /* _LINUX_E17_WDT_H */
