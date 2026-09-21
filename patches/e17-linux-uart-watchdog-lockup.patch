@@ -382,6 +382,137 @@ index 7ffb56240bf0..1c40fe94cdcd 100644
  		unsigned int d = 8192;
  
  		e17_ipi_poll();
+diff --git a/drivers/gpu/drm/tiny/e17_drm.c b/drivers/gpu/drm/tiny/e17_drm.c
+index 633f5aca3279..4ca99b9b1f57 100644
+--- a/drivers/gpu/drm/tiny/e17_drm.c
++++ b/drivers/gpu/drm/tiny/e17_drm.c
+@@ -394,6 +394,7 @@ struct e17_device {
+ 	unsigned long frame_jiffy;
+ 	u32 frame_per_jiffy;
+ 	bool frame_stormed;
++	bool frame_irq_active;	/* the LM1882 frame IRQ was actually requested */
+ 
+ 	struct drm_plane primary_plane;
+ 	struct drm_crtc crtc;
+@@ -855,17 +856,19 @@ static void e17_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	}
+ 
+ 	/*
+-	 * Complete the commit's flip event immediately.  The shadow-plane blit is
+-	 * synchronous (the pixels are already in VRAM by now), so there is nothing
+-	 * to defer to a real frame; sending here -- instead of arming it on a vblank
+-	 * -- is what keeps a commit from ever blocking.  See e17_commit_tail() for
+-	 * why this driver deliberately does not wait for vblank.  When vblank is off
+-	 * the commit tail's fake-vblank path delivers the event instead, so only send
+-	 * it here when vblank is actually enabled.
++	 * Deliver the commit's flip event.  The shadow-plane blit is synchronous
++	 * (the pixels are already in VRAM), so with vblank enabled we ARM the
++	 * event on the next real frame interrupt - proper vsync pacing for
++	 * userspace - falling back to an immediate send if a vblank reference
++	 * cannot be taken.  With vblank off, the commit-tail fake-vblank path
++	 * delivers it instead, so nothing to do here.
+ 	 */
+ 	if (e17_vblank && crtc_state->event) {
+ 		spin_lock_irq(&crtc->dev->event_lock);
+-		drm_crtc_send_vblank_event(crtc, crtc_state->event);
++		if (drm_crtc_vblank_get(crtc) == 0)
++			drm_crtc_arm_vblank_event(crtc, crtc_state->event);
++		else
++			drm_crtc_send_vblank_event(crtc, crtc_state->event);
+ 		crtc_state->event = NULL;
+ 		spin_unlock_irq(&crtc->dev->event_lock);
+ 	}
+@@ -892,11 +895,23 @@ static const struct drm_crtc_helper_funcs e17_crtc_helper_funcs = {
+  */
+ static int e17_enable_vblank(struct drm_crtc *crtc)
+ {
++	/*
++	 * If the frame IRQ was actually requested it is the vblank source (real
++	 * per-frame hardware timing); it runs continuously, so there is nothing
++	 * to start here - e17_frame_isr calls drm_crtc_handle_vblank().  Where
++	 * there is no real frame IRQ (e.g. QEMU, which does not model it), fall
++	 * back to drm's low-res hrtimer so vblank still ticks and the fbdev wait
++	 * does not hang.
++	 */
++	if (to_e17(crtc->dev)->frame_irq_active)
++		return 0;
+ 	return drm_crtc_vblank_start_timer(crtc);
+ }
+ 
+ static void e17_disable_vblank(struct drm_crtc *crtc)
+ {
++	if (to_e17(crtc->dev)->frame_irq_active)
++		return;
+ 	drm_crtc_vblank_cancel_timer(crtc);
+ }
+ 
+@@ -1122,6 +1137,19 @@ static irqreturn_t e17_frame_isr(int irq, void *dev_id)
+ 	n = atomic_inc_return(&e17_frame_count);
+ 	if (n == 1)
+ 		pr_info("e17drm: frame interrupt is being delivered (IRQ %d)\n", irq);
++
++	/*
++	 * Real hardware vsync: when vblank is enabled, drive DRM's vblank from
++	 * this genuine per-frame interrupt instead of the low-res hrtimer.  This
++	 * used to wedge - a vblank waiter on the other CPU was woken cross-CPU
++	 * and the wake timed out - but that was the unserialised CPU2CON IPI
++	 * race (now fixed with e17_smp_reg_lock), so the cross-CPU wake is
++	 * reliable.  drm_crtc_handle_vblank() is a no-op if vblank accounting is
++	 * not currently on, so this is safe on every frame.
++	 */
++	if (e17_vblank)
++		drm_crtc_handle_vblank(&e17->crtc);
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -1248,17 +1276,20 @@ static int e17_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
+-	drm_client_setup(dev, NULL);	/* fbdev at preferred_depth (C8/8bpp) */
+-
+ 	/*
+ 	 * Video frame interrupt: route the LM1882 frame pulse to VIC LIRQ4 and
+-	 * request it as a counting-only ISR (visible in /proc/interrupts, confirms
+-	 * the real frame rate).  It does NOT drive vblank -- see e17_frame_isr.
++	 * request its ISR.  It is counting-only unless vblank is on, in which case
++	 * e17_frame_isr drives DRM vblank from it (real hardware vsync).
+ 	 * $FEC5.4001 FR bit = 0xfc, RMON's default; write-only, never RMW.  NB: the
+ 	 * HW manual Table 38 claims FR=0 routes to LIRQ4 and FR=1 disables, but the
+ 	 * board is the opposite (RMON leaves 0xfc / FR set and the frame IRQ fires,
+ 	 * confirmed on hardware) -- keep 0xfc, do not "fix" it to the manual.
+ 	 *
++	 * This MUST happen before drm_client_setup(): fbcon's first modeset enables
++	 * vblank, and with the frame IRQ as the vblank source the fbdev damage
++	 * worker then waits for a frame interrupt.  If the IRQ were requested after
++	 * fbcon, that first wait would hang forever (no source yet).
++	 *
+ 	 * platform_get_irq_optional() maps LIRQ4, which masks LICR4 (irqchip
+ 	 * domain_map default), so when frame_irq is off we simply do not route or
+ 	 * request it: the line stays masked and no frame interrupt is delivered.
+@@ -1272,11 +1303,18 @@ static int e17_probe(struct platform_device *pdev)
+ 		if (!IS_ERR(irqroute))
+ 			writeb(0xfc, irqroute + 1);	/* FR -> LIRQ4 */
+ 		if (devm_request_irq(&pdev->dev, irq, e17_frame_isr, 0,
+-				     "e17-frame", e17))
++				     "e17-frame", e17)) {
+ 			drm_warn(dev, "cannot request frame IRQ %d\n", irq);
+-		else
+-			drm_info(dev, "frame interrupt on IRQ %d (counting)\n", irq);
++		} else {
++			e17->frame_irq_active = true;
++			drm_info(dev, "frame interrupt on IRQ %d (%s)\n", irq,
++				 e17_vblank ? "drives vblank" : "counting");
++		}
+ 	}
++
++	/* fbdev at preferred_depth (C8/8bpp).  After the frame IRQ so that its
++	 * first modeset's vblank wait has a source (see above). */
++	drm_client_setup(dev, NULL);
+ 	return 0;
+ }
+ 
 diff --git a/drivers/net/ethernet/amd/e17-lance.c b/drivers/net/ethernet/amd/e17-lance.c
 index 6e7c3baadf27..13317dc47758 100644
 --- a/drivers/net/ethernet/amd/e17-lance.c

@@ -76,11 +76,16 @@ class Telnet:
         self.s.sendall(s.encode() if isinstance(s, str) else s)
 
 
-def answer_auth(t, log, started, seen):
-    """If the peer is asking for a code, read it from the securetty and send it."""
+def answer_auth(t, log, started, seen, wait=12.0):
+    """If the peer asks (or is about to ask) for a code, read it from the
+    securetty and send it.  getty can be slow to print the prompt under load,
+    so wait for "code:" to appear rather than giving up on the first read."""
+    end = time.time() + wait
+    while b"code:" not in seen and time.time() < end:
+        seen += t.read(1)
     if b"code:" not in seen:
         return False
-    for _ in range(20):
+    for _ in range(40):
         code = newest_code(log, started)
         if code:
             t.send(code + b"\n")

@@ -818,7 +818,7 @@ index f1ecda53c66..aa911a0da88 100644
  	/* Set the machine */
 
 diff --git a/include/configs/e17.h b/include/configs/e17.h
-index fd4836e61a7..0e307f6188f 100644
+index fd4836e61a7..78642dc201f 100644
 --- a/include/configs/e17.h
 +++ b/include/configs/e17.h
 @@ -26,12 +26,66 @@
@@ -884,7 +884,7 @@ index fd4836e61a7..0e307f6188f 100644
 +		"autoload=no\0" \
 +		"bootfile=e17/vmlinux.e17.stripped.lz4\0" \
 +		"initrd_file=e17-rootfs.cpio\0" \
-+		"bootargs=console=tty0 console=ttyS0 ip=dhcp e17_idle=spin panic=10 -- smolinit.telnetd=23 smolinit.securetty=/dev/ttyS0\0" \
++		"bootargs=console=tty0 console=ttyS0 ip=dhcp e17_idle=spin panic=10 sysctl.kernel.panic_on_rcu_stall=1 e17_drm.frame_irq=1 e17_drm.vblank=1 -- smolinit.telnetd=23 smolinit.securetty=/dev/ttyS0\0" \
 +		"nfetch=dhcp; " \
 +			"tftp ${loadaddr} ${bootfile}; crc32 ${loadaddr} ${filesize}\0" \
 +		"nprep=unlz4 ${loadaddr} ${bootaddr} ${dstsize}\0" \
