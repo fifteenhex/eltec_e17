@@ -71,7 +71,7 @@ MQTTFILE    ?= /workspace/src/smolmqtt/mqttfile
 TARWAK      ?= /workspace/src/tarwak/build/tarwak
 # The booted kernel's telnetd, which is how commands get in (the serial
 # console is output-only once Linux is up).
-E17_HOST    ?= 192.168.2.221
+E17_HOST    ?= 192.168.2.154
 
 # ---- QEMU run defaults ------------------------------------------------------
 

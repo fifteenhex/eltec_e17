@@ -12,7 +12,7 @@ captured from a script.
     e17sh.py --shell                     interactive-ish: read commands on stdin
 
 Options:
-    --host H      default $E17_HOST or 192.168.2.221
+    --host H      default $E17_HOST or 192.168.2.154
     --port P      default 23
     --timeout S   per-command quiet timeout (default 8)
 
@@ -94,7 +94,7 @@ class Telnet:
 
 def main():
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--host", default=os.environ.get("E17_HOST", "192.168.2.221"))
+    ap.add_argument("--host", default=os.environ.get("E17_HOST", "192.168.2.154"))
     ap.add_argument("--port", type=int, default=23)
     ap.add_argument("--timeout", type=float, default=8.0)
     ap.add_argument("-f", "--file")

@@ -57,7 +57,7 @@ def main():
     ap.add_argument("--topic", default=os.environ.get("E17_TOPIC",
                                                       "m68k/e17/serial"))
     ap.add_argument("--host", default=os.environ.get("E17_HOST",
-                                                     "192.168.2.221"))
+                                                     "192.168.2.154"))
     ap.add_argument("--bootfile", default="e17/vmlinux.e17.stripped.lz4")
     ap.add_argument("--no-reboot", action="store_true")
     ap.add_argument("--dry-run", action="store_true")

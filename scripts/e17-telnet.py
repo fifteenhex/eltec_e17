@@ -93,7 +93,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser()
     ap.add_argument("cmds", nargs="*")
-    ap.add_argument("--host", default=os.environ.get("E17_HOST", "192.168.2.221"))
+    ap.add_argument("--host", default=os.environ.get("E17_HOST", "192.168.2.154"))
     ap.add_argument("--port", type=int, default=23)
     ap.add_argument("--root", action="store_true", help="su to root first")
     ap.add_argument("--log", default=os.path.join(here, os.pardir, "build", "console.log"))

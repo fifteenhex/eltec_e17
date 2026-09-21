@@ -690,7 +690,7 @@ index 0149b44d077..2d6c540935c 100644
  #endif /* _WATCHDOG_H_ */
 
 diff --git a/board/eltec/e17/dummy.c b/board/eltec/e17/dummy.c
-index f1ecda53c66..5e0a6fe365d 100644
+index f1ecda53c66..aa911a0da88 100644
 --- a/board/eltec/e17/dummy.c
 +++ b/board/eltec/e17/dummy.c
 @@ -10,6 +10,11 @@
@@ -766,6 +766,57 @@ index f1ecda53c66..5e0a6fe365d 100644
  }
  
  int dram_init(void)
+@@ -197,6 +258,49 @@ int cpu_init_r(void)
+ 	return 0;
+ }
+ 
++/*
++ * Read the board's real Ethernet station address and publish it as the
++ * "ethaddr" environment variable so u-boot networking (BOOTP/TFTP) uses the
++ * factory MAC instead of a random one (CONFIG_NET_RANDOM_ETHADDR).
++ *
++ * The authoritative MAC is six plain consecutive bytes in the battery-backed
++ * NVRAM board-ID block at 0xfec20488 - dumped on the real board it reads
++ * 00 00 5b 00 49 62, exactly what RMON prints.  (The earlier guess of a
++ * nibble-encoded PROM in the ILACC window at 0xfec69d81 was wrong: that window
++ * just returns a constant 00 00 00 04 pattern, which decoded to the bogus
++ * 04:00:04:00:04:00.)
++ *
++ * Best-effort: if the block is empty/unpopulated (all-zero, e.g. under QEMU
++ * which does not model the NVRAM) or an ethaddr is already set, leave the
++ * environment alone and let the normal random-address path run.
++ */
++#define E17_NVRAM_MAC	0xfec20488	/* board-ID block, 6 bytes, big-endian */
++
++static void e17_read_mac_from_prom(u8 mac[6])
++{
++	const void __iomem *nv = (const void __iomem *)E17_NVRAM_MAC;
++	int i;
++
++	for (i = 0; i < 6; i++)
++		mac[i] = readb(nv + i);
++}
++
++int board_late_init(void)
++{
++	u8 mac[6];
++
++	if (env_get("ethaddr"))
++		return 0;		/* already provisioned - respect it */
++
++	e17_read_mac_from_prom(mac);
++	if (is_valid_ethaddr(mac)) {
++		eth_env_set_enetaddr("ethaddr", mac);
++		printf("E17: station address %pM (from board PROM)\n", mac);
++	}
++
++	return 0;
++}
++
+ struct bi_record* m68k_get_mach(struct bi_record *r)
+ {
+ 	/* Set the machine */
+
 diff --git a/include/configs/e17.h b/include/configs/e17.h
 index fd4836e61a7..0e307f6188f 100644
 --- a/include/configs/e17.h

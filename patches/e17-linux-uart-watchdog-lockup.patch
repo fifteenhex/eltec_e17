@@ -203,6 +203,89 @@ index 7ffb56240bf0..1c40fe94cdcd 100644
  		unsigned int d = 8192;
  
  		e17_ipi_poll();
+diff --git a/drivers/net/ethernet/amd/e17-lance.c b/drivers/net/ethernet/amd/e17-lance.c
+index 6e7c3baadf27..13317dc47758 100644
+--- a/drivers/net/ethernet/amd/e17-lance.c
++++ b/drivers/net/ethernet/amd/e17-lance.c
+@@ -151,20 +151,16 @@
+ #define BCNT(len)	((0xf << 12) | ((-(len)) & 0xfff))
+ 
+ /*
+- * Station-address PROM.  The six MAC bytes live in the byte-wide PROM that
+- * overlays the LANCE window at base + 0x1d81 (physical 0xfec69d81), each byte
+- * stored as two nibbles on ascending odd byte lanes, stride 2, high nibble
+- * first.  This encoding was recovered from the RMON monitor's own station-
+- * address reader (ROM fe816c28: base 0xfec68000, +0x1d01, +0x80, 12 reads at
+- * stride 2, low nibble of each) - it is exactly how the factory firmware
+- * obtains the address, so it yields the real per-board MAC on hardware.
+- * (QEMU does not model this PROM and returns 0, so the read is validated and
+- * falls back gracefully.)
++ * Station address.  The authoritative MAC is six plain consecutive bytes in
++ * the battery-backed NVRAM board-ID block at physical 0xfec20488 - dumped on
++ * the real board it reads 00 00 5b 00 49 62, exactly what RMON prints.  (An
++ * earlier guess of a nibble-encoded PROM in the ILACC window at 0xfec69d81 was
++ * wrong: that window just returns a constant 00 00 00 04 pattern, which
++ * decoded to the bogus 04:00:04:00:04:00.)  QEMU does not model the NVRAM and
++ * returns 0, so the read is validated and falls back gracefully.
+  */
+-#define E17_LANCE_MAC_PROM	0xfec69d00
+-#define E17_LANCE_MAC_PROM_SZ	0x100
+-#define E17_LANCE_MAC_PROM_OFF	0x81	/* first nibble: 0xfec69d81 */
+-#define E17_LANCE_MAC_PROM_STRIDE 4	/* per MAC byte (two nibbles, +0/+2)  */
++#define E17_NVRAM_MAC		0xfec20488	/* board-ID block, 6 bytes */
++#define E17_NVRAM_MAC_SZ	ETH_ALEN
+ 
+ /*
+  * The ILACC IRQ pin feeds VIC068A local input LIRQ7.  Masking/levelling LICR7
+@@ -684,15 +680,15 @@ static const struct net_device_ops e17lance_netdev_ops = {
+  * Obtain the station address.  Priority:
+  *   1. a "local-mac-address"/"mac-address"/nvmem DT property (u-boot fills
+  *      this on the real board, and it is the reliable source);
+- *   2. the on-board station-address PROM at 0xfec69d81 (the same source and
+- *      nibble encoding the RMON firmware reads - see E17_LANCE_MAC_PROM; the
+- *      QEMU model returns 0 here, so it is validated before use);
++ *   2. the NVRAM board-ID block at 0xfec20488 (the authoritative factory MAC,
++ *      the same one RMON prints; the QEMU model returns 0 here, so it is
++ *      validated before use);
+  *   3. a random address with the ELTEC OUI, as a last resort.
+  */
+ static void lance_get_mac(struct platform_device *pdev, struct net_device *dev)
+ {
+ 	u8 mac[ETH_ALEN];
+-	void __iomem *prom;
++	void __iomem *nv;
+ 	int i;
+ 
+ 	if (of_get_mac_address(pdev->dev.of_node, mac) == 0 &&
+@@ -701,22 +697,12 @@ static void lance_get_mac(struct platform_device *pdev, struct net_device *dev)
+ 		return;
+ 	}
+ 
+-	prom = ioremap(E17_LANCE_MAC_PROM, E17_LANCE_MAC_PROM_SZ);
+-	if (prom) {
+-		/*
+-		 * Each of the six address bytes is two nibbles at +0x81+i*4
+-		 * (high) and +0x83+i*4 (low), i.e. odd byte lanes at stride 2,
+-		 * exactly as RMON's fe816c28 reads them.  Assemble and validate.
+-		 */
+-		for (i = 0; i < ETH_ALEN; i++) {
+-			unsigned int o = E17_LANCE_MAC_PROM_OFF +
+-					 i * E17_LANCE_MAC_PROM_STRIDE;
+-			u8 hi = readb(prom + o) & 0x0f;
+-			u8 lo = readb(prom + o + 2) & 0x0f;
+-
+-			mac[i] = (hi << 4) | lo;
+-		}
+-		iounmap(prom);
++	nv = ioremap(E17_NVRAM_MAC, E17_NVRAM_MAC_SZ);
++	if (nv) {
++		/* Six plain consecutive bytes, big-endian. */
++		for (i = 0; i < ETH_ALEN; i++)
++			mac[i] = readb(nv + i);
++		iounmap(nv);
+ 
+ 		if (is_valid_ether_addr(mac)) {
+ 			eth_hw_addr_set(dev, mac);
 diff --git a/drivers/tty/serial/serial_e17_cd2401.c b/drivers/tty/serial/serial_e17_cd2401.c
 index 07fa8ac13d12..786cf850d378 100644
 --- a/drivers/tty/serial/serial_e17_cd2401.c
