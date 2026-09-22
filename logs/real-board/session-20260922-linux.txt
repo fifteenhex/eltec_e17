@@ -121,3 +121,28 @@ NET: IPI/NMI rework finished and confirmed working; it resolves A1 (TLB-flush-de
 the early RCU stall). A2 (the AP/VIC-clock level-4 tick intermittently dying early in boot) is a
 separate, still-open mechanism -- the next target. Soak rate was unmeasurable cleanly (telnet-
 auth-race + netboot-driving TIMEOUTs muddied it). Board self-heals from both (panic=10 reboot).
+
+=== 2026-09-22: Bug A2 FIXED and validated (AP tick run with IRQs masked) ===
+Built an NMI-backtrace facility (CPU0 NMIs CPU1 when its tick heartbeat freezes; the level-7
+NMI pierces the IPL-7 mask and records CPU1's PC/stack/regs). It caught A2 red-handed:
+  CPU1 stuck: do_raw_spin_lock <- raw_spin_rq_lock <- sched_ttwu_pending  (inner, IPL7)
+              <- handle_IPI(CALL_FUNC) <- e17_ipi_isr                     (the level-6 IPI)
+  outer holder (same CPU1): sched_tick -> task_tick_fair -> update_load_avg
+  CPU0 idle; CPU0's view of the rq lock = 0x03de03dc / 0x073f073d = HELD (real deadlock, not a
+  stale-cache coherency miss; that hypothesis was tested and rejected via the CPU0-side read).
+ROOT CAUSE: the AP VIC-clock tick is a level-4 autovector, so e17_ap_tick() runs at IPL4, which
+masks only <=4 and leaves the level-6 mailbox IPI able to NEST. sched_tick() takes the rq lock
+with rq_lock() (a plain raw_spin_lock that assumes the timer IRQ already runs IRQs-off, true on
+every other arch). On m68k it doesn't: the level-6 IPI nests into the rq-lock-held tick and
+sched_ttwu_pending() re-enters the same ticket rq lock -> self-deadlock -> CPU1 tick dies ->
+rcu_sched starves -> panic_on_rcu_stall reboots. (CPU0's tick is level 6 == the IPI level, so it
+is already nesting-safe; only the AP tick was affected. First m68k SMP board, so first to hit it.)
+FIX: run the AP tick body (legacy_timer_tick + the IPI-backstop drain) under local_irq_save()
+(IPL7), restoring the IRQs-off-timer-handler invariant the scheduler relies on. The level-7 NMI
+TLB path is unaffected (non-maskable, lock-free). Committed linux e17-clean 6505d5862c7e.
+Tried-and-rejected along the way: removing the per-tick IPI backstop (A2 persisted AND early
+lost-edge hangs got worse -> backstop restored).
+VALIDATION (real board): 15/15 clean boots, A2=0, other=0. Zero tick-dead captures since the fix
+(the diagnostic stays in, harmless). Before: A2 hit ~1 in 3-7 boots.
+Bug A now fully resolved: A1 (TLB-flush deadlock) via level-7 NMI TLB; A2 (tick-vs-IPI rq-lock
+re-entrancy) via IPL7 AP tick.
