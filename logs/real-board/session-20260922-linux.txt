@@ -152,3 +152,45 @@ Cold power cycle -> clean boot. Then 40-boot soak: 40/40 CLEAN, A2=0, other=0. Z
 captures, zero RCU stalls/panics across the whole window. NMI-TLB in use every boot (0 timeouts).
 Boot stability: from ~1-in-3-to-7 flaky (pre-fixes) to 40/40 clean from cold. Bug B (brick),
 A1 (TLB-flush deadlock) and A2 (tick-vs-IPI rq-lock re-entrancy) all resolved and validated.
+
+=== 2026-09-22: CORRECTION -- "40/40 clean" over-measured; userspace-stage bug found ===
+The 40-boot acceptance classified CLEAN at "Run /init as init process" -- BEFORE userspace init.
+Re-analysis of the same window: Run/init reached 41, but ttyS0 getty started only 14, telnetd
+only 8. ~2/3 of boots WATCHDOG-RESET during "Starting getty on /dev/tty1" (the framebuffer
+console getty) before reaching the UART getty. So the kernel/SMP boot path (A1/A2) is stable, but
+USERSPACE bringup is NOT: the tty1 fbcon getty resets the board ~1-in-3-to-2-in-3.  Likely the
+DRM/fbcon VRAM-under-SMP bus lock (the e17fb *boot* console is gated to single-CPU via
+num_online_cpus()>1, but the tty1 getty's fbcon path is not).
+UART itself: FULLY FUNCTIONAL when reached. On a full boot, verified interactive RX live on the
+current kernel: 5/5 typed commands (echo/cat) echoed + executed at the ttyS0 smolsh, no hang,
+board alive (poll=0 holds). TX/console works every boot.
+NET: UART driver good; reliable ACCESS to it is gated by the tty1-getty reset (new open bug,
+call it "Bug D" -- fbcon/DRM VRAM under SMP). Fix options: gate/serialise the fbcon VRAM path
+under SMP like the boot console, or drop smolinit.getty=/dev/tty1 from the default bootargs.
+
+=== 2026-09-22: Bug D root cause via VIC dump + ICR RMC fix (IN VALIDATION) ===
+Added VIC068A full register dump (irqchip late_initcall) + read the datasheet at
+/workspace/files/VIC068A_register_map.md. Live config decoded:
+  TTR $A3=0x44 : local-bus timeout ENABLED 16ms (but BESR $BB=0x00 -> never fired,
+                 so the hang is NOT a plain no-DTACK cycle).
+  ICR $AF=0xf0 : SCON=0 (VIC is VME system controller); bit4=1 deadlock->HALT*+LBERR*
+                 +DEDLK*; bits7-5=1 = RMC control (bit5 = "request VMEbus whenever
+                 RMC* asserted, independent of MWB*").
+  ARCR $B3=0x60: fairness disabled, round-robin, VME req BR3.  RCR $D3=0x00: ROR.
+ROOT CAUSE (hypothesis, high confidence): the 68040 asserts RMC* on every locked
+CAS/TAS (every spinlock/atomic). ICR bit5=1 => VIC fires a VMEbus arbitration
+request on EVERY SMP spinlock, though DRAM is local. SMP-startup spinlock storm
+floods VME arbitration; a deadlock asserts HALT* (bit4) to BOTH CPUs -> whole-bus
+hang, both frozen at random PCs, watchdog reset (the 16ms local timeout doesn't
+catch a HALT*). Matches: e17drm-on unreliable, blit/console/getty tweaks don't fix.
+FIX (committed linux e17-clean ea342cd, deployed kernel crc ab3e3987): at irqchip
+probe (before SMP bring-up) read-modify-write ICR &= ~0xe0 (clear RMC->VMEbus bits
+7-5). ICR write is NOT SYSRESET-risky (only SRR $E3<-$F0 is). Local CAS no longer
+touches the VMEbus. VME-side RMC/atomicity deferred (we don't use VME yet).
+VALIDATION IN PROGRESS: soak logs/real-board/boots/bugD-icrfix-*.out. Metric =
+telnetd listening (full userspace). Guardrail: cross-CPU atomicity self-test must
+still pass (CAS bus-atomic). Boot 1 still reset (0x60) -- need the rate over more
+boots; a clean boot's VIC re-dump (late_initcall) will confirm ICR=0x10.
+IF THIS DOESN'T WORK: next levers = also clear ICR bit4 (deadlock->HALT* : set to
+DEDLK-only so a deadlock doesn't halt the CPUs); or reduce TTR local timeout; or
+the SS0CR0/arbitration. All non-SYSRESET (avoid SRR $E3).
