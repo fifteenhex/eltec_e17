@@ -99,3 +99,25 @@ STATUS: Bug B (dangerous brick) FIXED+validated. Bug A (this) is recoverable (se
 panic=10 reboot -> ~10-30% of boots need one retry), now precisely root-caused with stack traces.
 The fix is a deep m68k SMP tick/IPI-delivery investigation in the delicate VIC-clock AP-tick /
 CPU2CON path -- flagging for a design decision rather than a blind change under board-hang risk.
+
+=== 2026-09-22: level-7 (NMI) TLB IPI rework DONE; splits Bug A into two mechanisms ===
+Implemented CONFIG_E17_SMP_NMI_TLB (default y in e17 defconfig): the boot CPU delivers its
+cross-CPU flush_tlb_* to the secondary as a level-7 (non-maskable) mailbox IPI so it pierces
+the secondary's spin_lock_irqsave IPL-7 mask. Lock-free NMI handler (raw mailbox ack + local
+pflusha), plain req/ack handshake (single writer each, sender synchronous IRQs-off), bounded
+spin -> falls back to on_each_cpu. Only boot-CPU->secondary is rerouted. Committed e17-clean
+ac6abd9213b5.
+VALIDATION (hardware): the NMI path is real and reliable -- clean boots report
+"E17 SMP: NMI-TLB usage: N acked, 0 timed-out->fallback" (7 acked, 3 acked seen; ZERO
+timeouts). So A1 -- the CPU0-stuck-in-on_each_cpu(ipi_flush_tlb_all) deadlock (the boot-2
+signature) -- is addressed: the secondary now services the flush even mid-spinlock.
+BUT Bug A is NOT one bug. A soak still hit RCU-stall reboots with a DIFFERENT signature:
+  A2 = CPU1 tick death: CPU0 IDLE (default_idle_call), CPU1 running kdevtmpfs (R), rcu_sched
+       starved on cpu=1, "Possible timer handling issue on cpu=1 timer-softirq=NN" (tick fired
+       ~76 times then STOPPED). No VIC-clock storm/runaway DISABLE message -> not the self-
+       protect. This is NOT a TLB-flush deadlock (CPU0 isn't flushing), so the NMI-TLB fix
+       does not and cannot address it. A2 pre-dates the NMI fix (finer-milestone soak boot 7).
+NET: IPI/NMI rework finished and confirmed working; it resolves A1 (TLB-flush-deadlock cause of
+the early RCU stall). A2 (the AP/VIC-clock level-4 tick intermittently dying early in boot) is a
+separate, still-open mechanism -- the next target. Soak rate was unmeasurable cleanly (telnet-
+auth-race + netboot-driving TIMEOUTs muddied it). Board self-heals from both (panic=10 reboot).
