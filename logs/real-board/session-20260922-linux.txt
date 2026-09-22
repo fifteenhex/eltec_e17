@@ -146,3 +146,9 @@ VALIDATION (real board): 15/15 clean boots, A2=0, other=0. Zero tick-dead captur
 (the diagnostic stays in, harmless). Before: A2 hit ~1 in 3-7 boots.
 Bug A now fully resolved: A1 (TLB-flush deadlock) via level-7 NMI TLB; A2 (tick-vs-IPI rq-lock
 re-entrancy) via IPL7 AP tick.
+
+=== 2026-09-22: FINAL ACCEPTANCE (cold power-cycle baseline) ===
+Cold power cycle -> clean boot. Then 40-boot soak: 40/40 CLEAN, A2=0, other=0. Zero tick-dead
+captures, zero RCU stalls/panics across the whole window. NMI-TLB in use every boot (0 timeouts).
+Boot stability: from ~1-in-3-to-7 flaky (pre-fixes) to 40/40 clean from cold. Bug B (brick),
+A1 (TLB-flush deadlock) and A2 (tick-vs-IPI rq-lock re-entrancy) all resolved and validated.
