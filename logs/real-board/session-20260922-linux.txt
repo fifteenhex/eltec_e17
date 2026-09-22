@@ -1,0 +1,19 @@
+=== 2026-09-22: Bug B FIXED (LANCE DMA-into-freed-memory at u-boot->kernel handoff) ===
+Root cause (found in drivers/net/lance.c lance_stop): wrote CSR0_STOP then IMMEDIATELY
+free()d priv->rxbuf without waiting for the Am7990 (bus master) to quiesce. In-flight rx
+DMA continues into the freed buffer once it's back on the heap / handed to Linux -> random
+RAM corruption -> intermittent silent hard-hang right after kernel TFTP/CRC, before console
+or watchdog -> no recovery (needs manual reset). Also a free-order bug (nulled dma_data
+before freeing it -> leak).
+eth_halt() DOES reach lance_stop before bootelf (net_loop line 783 calls it unconditionally),
+so no elf.c change needed -- confirms the user's chosen driver-side fix over re-adding the
+reverted bootelf_exec CSR0=STOP poke (b8e0be2d206 / revert 3b1a2fa8cb7).
+FIX: poll CSR0 until RXON|TXON clear before freeing, bounded 100ms (can't hang boot itself);
+fixed free order. Committed u-boot e17-fixes 855e79ea391, deployed (u-boot.e17boot crc 04f8b940).
+VALIDATION (real board, clean power-cycle baseline): 6/6 clean boots after fix, 0 Bug B, 0 Bug A.
+(Bug B was ~1/3 before; P(6 clean | 1/3) ~= 0.09, plus exact mechanistic match => strong.)
+Tooling note: e17-telnet.py auth desyncs on rapid reboot right after userspace (fresh
+securetty code race); robust cycle harness (start netboot capture first, retry reboot only
+until RMON appears, never false-brick) fixed the A/B. Board healthy throughout.
+Remaining: Bug A (early RCU stall) quiet on clean baseline w/ IPI backstop (0/6 here);
+frame_irq=1 vblank=1 hard hang still deferred (hrtimer vsync is the working path).
