@@ -17,3 +17,85 @@ securetty code race); robust cycle harness (start netboot capture first, retry r
 until RMON appears, never false-brick) fixed the A/B. Board healthy throughout.
 Remaining: Bug A (early RCU stall) quiet on clean baseline w/ IPI backstop (0/6 here);
 frame_irq=1 vblank=1 hard hang still deferred (hrtimer vsync is the working path).
+
+=== 2026-09-22: boot-flakiness taxonomy CORRECTED -- three modes, only one bricks ===
+Extended soak after the lance fix hit a failure on ~boot 7. Authoritative capture is
+build/console.log (conlog, always running) -- the netboot inline capture drops MQTT bursts
+and hid the real hang point. console.log showed the truth:
+  "bootelf_exec: >>> jumping to kernel entry 0x2000 <<<"  immediately followed by
+  "### Watchdog Reset" + RMON banner -- ZERO kernel console output in between.
+=> The kernel hung INSTANTLY at ELF entry 0x2000 (head.S, before any console/earlycon),
+   and u-boot's watchdog ("Watchdog enabled" in its banner) reset it ~1.6s later. RMON then
+   reloaded u-boot; board sat at "e17 =>". It SELF-RECOVERED; "run netboot" booted cleanly.
+Corrected taxonomy of the boot flakiness:
+  (A) RCU stall / tick death -- LATE (RCU running); recovers (kernel watchdog + panic=10).
+  (B) LANCE DMA-into-freed-mem -- hang in u-boot AFTER kernel CRC (unlz4/bootelf), pre-console;
+      the ORIGINAL non-recoverable brick (needed power cycle). FIXED (lance_stop quiesce) + 6/6.
+  (C) early-kernel-ENTRY hang -- kernel wedges at entry 0x2000 before ANY console output;
+      RECOVERED by u-boot's watchdog. This is the main remaining intermittent flakiness.
+IMPORTANT tooling correction: the cycle-harness "brick" verdicts were FALSE. A recoverable
+Bug-C hang leaves the board momentarily silent / at u-boot (telnet dead because it's not Linux),
+which the classifier misread as a brick. Real recovery path = u-boot watchdog -> RMON -> u-boot
+prompt; just re-drive netboot. Only a true never-recovers-silent-forever counts as a brick.
+Next (safe): review m68k head.S / early SMP entry (pre-console) for an intermittent hazard at
+entry 0x2000. Hard to instrument (before console); breadcrumb NVRAM isn't up yet that early.
+
+=== 2026-09-22: Bug C is a REAL pre-console early hang (not a watchdog race) ===
+Added fb-bootconsole watchdog pet (config.c e17_fb_cons_write): completes the documented
+early-boot watchdog-coverage chain (head.S / config_eltec_e17 / [fb console] / tick / CD2401).
+It is harmless and correct BUT did NOT fix Bug C -> Bug C is a genuine hang, not slow-boot
+watchdog starvation. Soak with the new kernel (crc dbea2dc4): 9 clean / 1 Bug C over 10 boots
+(~10%). Bug C recovers via u-boot's watchdog every time (kernel-entry hang -> ### Watchdog
+Reset -> RMON -> u-boot -> re-netboot).
+Diagnosis blocker: Bug C hangs BEFORE any serial console (all early output goes to the e17fb
+framebuffer bootconsole = physical display, invisible over serial; ttyS0 console only comes up
+at CD2401 probe, late). The hang state is transient (~1.6s) before the u-boot watchdog wipes
+it, so the display/7-seg can't be read in time. A CD2401 earlycon is risky (needs the
+software-IACK-into-service-context dance that historically wedges the bus; per user warning).
+PLAN: extend the battery-backed NVRAM breadcrumb (0xfec20600) with early-boot MILESTONE codes
+written from head.S entry through console_init/time_init/smp bringup. On a Bug C the next boot
+dumps the last milestone over serial -> localizes the hang with no human eyes and surviving the
+reset. This is the safe, persistent diagnostic for a pre-console hang.
+
+=== 2026-09-22: milestone breadcrumb CRACKS "Bug C" -- it's (at least) two modes ===
+Persistent early-boot milestone (NVRAM, survives reset) deployed. A soak hit caught a failure
+whose next-boot milestone = 0x27 (E17_EARLY_SERIAL: serial console was already up). Because
+serial was live, the full death was captured: it is a KERNEL PANIC, not a silent hang --
+panic_on_rcu_stall -> vpanic, from CPU0's tick (e17_timer_int -> update_process_times ->
+rcu_sched_clock_irq -> panic_on_rcu_stall) while CPU0 was stuck in:
+    e17_probe (e17drm) -> devm_platform_ioremap_resource -> __devm_ioremap -> __ioremap
+      -> flush_tlb_all -> ipi_flush_tlb_all -> on_each_cpu   <-- cross-CPU TLB-flush IPI
+panic=10 then rebooted via the watchdog (mach_reset), which the soak had been miscounting as
+"Bug C". So the "~10% Bug C" bucket is really >=2 modes, separable by the milestone:
+  * 0x27  = RCU stall during a cross-CPU TLB flush (__ioremap in e17drm probe) -> panic/reboot.
+            This IS Bug A (the m68k cross-CPU IPI reliability problem): CPU0 spins in on_each_cpu
+            waiting for CPU1 to run ipi_flush_tlb_all; CPU1 doesn't, grace period stalls, panic.
+            The IPI backstop (per-tick drain) did not prevent this instance.
+  * <0x27 = genuinely silent pre-serial-console hang (still to be caught with a milestone).
+Root-cause tool working perfectly: the milestone + panic=10 + live serial gave a full stack
+trace of an intermittent early failure with zero human involvement.
+NEXT: gather the milestone distribution over a longer soak (how much is 0x27/Bug A vs a silent
+<0x27 hang); then target the cross-CPU TLB-flush reliability (the e17drm ioremap is a heavy
+early on_each_cpu right after AP bring-up).
+
+=== 2026-09-22: Bug A root-caused (the remaining boot instability) ===
+Finer-milestone soak (20 boots, stopped at 10): 7 clean, 3 failures (boots 2,7,9). ALL three
+failures reported prev-boot milestone 0x27 (E17_EARLY_SERIAL: serial console already up) and are
+RCU-stall panics (panic_on_rcu_stall -> reboot via watchdog; self-heals). Two captured signatures,
+same root:
+  boot 2: CPU0 stuck in on_each_cpu(ipi_flush_tlb_all) <- __ioremap in e17drm probe; RCU stall
+          detected from CPU0's tick. CPU1 not acking the cross-CPU TLB-flush IPI.
+  boot 7: "Possible timer handling issue on cpu=1, timer-softirq=24"; rcu_sched kthread starved
+          on cpu=1 (CPU1 running kdevtmpfs, R). CPU1's scheduler tick stopped preempting it.
+UNIFYING ROOT CAUSE (Bug A): in the early-device-init window right after AP bring-up, CPU1's
+cross-CPU coordination is unreliable -- its VIC-clock level-4 tick and/or its servicing of the
+mailbox/CALL_FUNC IPI intermittently stall. Result: either CPU0 hangs on a synchronous cross-CPU
+TLB flush (driver ioremaps do flush_tlb_all = on_each_cpu), or CPU1 starves rcu_sched -> RCU stall
+-> panic=10 reboot. The IPI backstop (per-tick drain) and e17_smp_reg_lock did not prevent it
+(the backstop itself relies on CPU1's tick, which is the thing that dies).
+No AP VIC-clock storm/runaway DISABLE message preceded boots 7/9, so the storm self-protection is
+NOT the trigger here; the level-4 tick delivery/servicing itself stalls.
+STATUS: Bug B (dangerous brick) FIXED+validated. Bug A (this) is recoverable (self-heals via
+panic=10 reboot -> ~10-30% of boots need one retry), now precisely root-caused with stack traces.
+The fix is a deep m68k SMP tick/IPI-delivery investigation in the delicate VIC-clock AP-tick /
+CPU2CON path -- flagging for a design decision rather than a blind change under board-hang risk.
